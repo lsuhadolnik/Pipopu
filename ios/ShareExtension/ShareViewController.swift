@@ -36,6 +36,8 @@ private struct ShareView: View {
     @State private var transfer: Transfer?
     @State private var error: String?
     @State private var selectedPeer: UUID?
+    @State private var sendAttempt: UUID?
+    @State private var finishedAttempt: UUID?
     @ScaledMetric(relativeTo: .body) private var tileWidth = 102.0
 
     private let accent = Color(red: 0.48, green: 0.32, blue: 0.89)
@@ -90,6 +92,10 @@ private struct ShareView: View {
                 }
             }
         }
+        .sensoryFeedback(.impact(weight: .light), trigger: sendAttempt)
+        .sensoryFeedback(trigger: finishedAttempt) { _, _ in
+            bluetooth.sendCompleted ? .success : .error
+        }
         .task {
             do { transfer = try await loadTransfer() }
             catch { self.error = error.localizedDescription }
@@ -136,7 +142,11 @@ private struct ShareView: View {
         return Button {
             guard let transfer else { return }
             selectedPeer = peer.id
-            bluetooth.send(transfer, to: peer.id)
+            let attempt = UUID()
+            sendAttempt = attempt
+            bluetooth.send(transfer, to: peer.id) { [finishedAttempt = $finishedAttempt] in
+                finishedAttempt.wrappedValue = attempt
+            }
         } label: {
             VStack(spacing: 8) {
                 ZStack {

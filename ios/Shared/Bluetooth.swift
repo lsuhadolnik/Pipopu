@@ -34,6 +34,7 @@ final class Bluetooth: NSObject, ObservableObject {
         let id: UUID
         let token = UInt32.random(in: .min ... .max)
         let data: Data
+        let onFinish: () -> Void
         var offset = 0
         var started = false
         var ended = false
@@ -75,12 +76,12 @@ final class Bluetooth: NSObject, ObservableObject {
 
     func clearReceived() { received = nil }
 
-    func send(_ transfer: Transfer, to id: UUID) {
+    func send(_ transfer: Transfer, to id: UUID, onFinish: @escaping () -> Void) {
         guard send == nil, let link = links[id] else { return }
         sendCompleted = false
         result = nil
         progress = 0
-        send = Send(id: id, data: transfer.envelope())
+        send = Send(id: id, data: transfer.envelope(), onFinish: onFinish)
         if link.upload != nil {
             writeNext(link)
         } else {
@@ -122,11 +123,12 @@ final class Bluetooth: NSObject, ObservableObject {
     }
 
     private func finish(_ error: Error? = nil) {
-        guard send != nil else { return }
+        guard let outgoing = send else { return }
         send = nil
         progress = nil
         result = error?.localizedDescription ?? "Sent"
         sendCompleted = error == nil
+        outgoing.onFinish()
     }
 
     private func writeNext(_ link: Link) {
