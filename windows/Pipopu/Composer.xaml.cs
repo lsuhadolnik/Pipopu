@@ -1,6 +1,8 @@
 using System.ComponentModel;
 using System.Text;
 using System.Windows;
+using System.Windows.Automation;
+using System.Windows.Input;
 using System.Windows.Media.Imaging;
 using Microsoft.Win32;
 
@@ -10,13 +12,17 @@ internal partial class Composer : FlyoutWindow
 {
     private readonly BluetoothServer server;
     private Transfer? attachment;
+    private CancellationTokenSource? sendCancellation;
     private bool sending;
     private bool exiting;
+    private bool renaming;
 
     internal Composer(BluetoothServer server)
     {
         this.server = server;
         InitializeComponent();
+        RefreshDeviceName();
+        SendView.CancelRequested += () => sendCancellation?.Cancel();
         Loaded += StartBluetooth;
         PreviewDragOver += OnDragOver;
         PreviewDrop += OnDrop;
@@ -41,9 +47,62 @@ internal partial class Composer : FlyoutWindow
         base.OnClosing(e);
     }
 
-    private void CloseClick(object sender, RoutedEventArgs e) => Hide();
+    private void CloseClick(object sender, RoutedEventArgs e)
+    {
+        FinishRename(save: true);
+        Hide();
+    }
 
-    internal void SetBluetoothStatus(string message) => BluetoothStatus.Text = message;
+    internal void SetBluetoothStatus(string message)
+    {
+        BluetoothIndicator.ToolTip = message;
+        AutomationProperties.SetName(BluetoothIndicator, message);
+    }
+
+    private void RefreshDeviceName()
+    {
+        NameLabel.Text = server.DeviceName;
+        AutomationProperties.SetName(NameButton, $"Change device name: {server.DeviceName}");
+    }
+
+    private void RenameClick(object sender, RoutedEventArgs e)
+    {
+        NameEdit.Text = server.DeviceName;
+        renaming = true;
+        NameButton.Visibility = Visibility.Collapsed;
+        NameEdit.Visibility = Visibility.Visible;
+        NameEdit.Focus();
+        NameEdit.SelectAll();
+    }
+
+    private void NameEditLostFocus(object sender, KeyboardFocusChangedEventArgs e) => FinishRename(save: true);
+
+    protected override void OnPreviewKeyDown(KeyEventArgs e)
+    {
+        if (renaming && e.Key is Key.Enter or Key.Escape)
+        {
+            e.Handled = true;
+            FinishRename(save: e.Key == Key.Enter);
+            NameButton.Focus();
+            return;
+        }
+        base.OnPreviewKeyDown(e);
+    }
+
+    private void FinishRename(bool save)
+    {
+        if (!renaming)
+            return;
+        renaming = false;
+
+        if (save)
+        {
+            TrySetPayload(() => server.Rename(NameEdit.Text));
+            RefreshDeviceName();
+        }
+        NameEdit.Visibility = Visibility.Collapsed;
+        NameButton.Visibility = Visibility.Visible;
+    }
 
     internal void RefreshPeers()
     {
@@ -201,6 +260,8 @@ internal partial class Composer : FlyoutWindow
         if (sending || Peers.SelectedItem is not BluetoothServer.Peer peer)
             return;
 
+        using var cancellation = new CancellationTokenSource();
+        sendCancellation = cancellation;
         sending = true;
         RefreshSend();
         Status.Text = "";
@@ -209,13 +270,17 @@ internal partial class Composer : FlyoutWindow
         try
         {
             var transfer = attachment ?? new Transfer(TransferKind.Text, "", Encoding.UTF8.GetBytes(Message.Text));
-            await server.SendAsync(peer, transfer, SendView);
+            await server.SendAsync(peer, transfer, SendView, cancellation.Token);
             if (!exiting)
             {
                 SendView.Complete();
                 Status.Text = $"Delivered to {peer.Name}";
                 await Task.Delay(900);
             }
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            Status.Text = "Send cancelled.";
         }
         catch (Exception error)
         {
@@ -226,6 +291,7 @@ internal partial class Composer : FlyoutWindow
         }
         finally
         {
+            sendCancellation = null;
             sending = false;
             if (!exiting)
             {

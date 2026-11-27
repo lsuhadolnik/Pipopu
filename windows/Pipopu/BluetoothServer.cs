@@ -1,6 +1,8 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
+using Microsoft.Win32;
 using Windows.Devices.Bluetooth;
 using Windows.Devices.Bluetooth.GenericAttributeProfile;
 using Windows.Storage.Streams;
@@ -13,6 +15,9 @@ internal sealed class BluetoothServer : IDisposable
     private static readonly Guid UploadId = new("EA259A31-8B6E-44DA-BEEC-E10D5680D630");
     private static readonly Guid DownloadId = new("EA259A32-8B6E-44DA-BEEC-E10D5680D630");
     private static readonly Guid NameId = new("EA259A33-8B6E-44DA-BEEC-E10D5680D630");
+    private const string DeviceNameKey = @"Software\Pipopu";
+    private const string DeviceNameValue = "DeviceName";
+    private const int MaxDeviceNameBytes = 64;
 
     internal sealed record Peer(string Id, string Name)
     {
@@ -28,11 +33,48 @@ internal sealed class BluetoothServer : IDisposable
     private GattServiceProvider? provider;
     private GattLocalCharacteristic? upload;
     private GattLocalCharacteristic? download;
+    private GattLocalCharacteristic? nameCharacteristic;
+    private string deviceName = LoadDeviceName();
     private bool disposed;
 
     internal event Action<Transfer>? TransferReceived;
     internal event Action? PeersChanged;
     internal event Action<string>? StatusChanged;
+
+    internal string DeviceName => Volatile.Read(ref deviceName);
+
+    internal void Rename(string value)
+    {
+        string name = value.Trim();
+        if (name.Length == 0)
+            name = Environment.MachineName;
+        if (!IsValidName(name))
+            throw new ArgumentException("Choose a shorter device name without control characters.");
+        if (name == DeviceName)
+            return;
+
+        using var settings = Registry.CurrentUser.CreateSubKey(DeviceNameKey);
+        settings.SetValue(DeviceNameValue, name);
+        Volatile.Write(ref deviceName, name);
+    }
+
+    private static string LoadDeviceName()
+    {
+        try
+        {
+            using var settings = Registry.CurrentUser.OpenSubKey(DeviceNameKey);
+            if (settings?.GetValue(DeviceNameValue) is string name && IsValidName(name))
+                return name;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            Debug.WriteLine(error);
+        }
+        return Environment.MachineName;
+    }
+
+    private static bool IsValidName(string name) =>
+        !string.IsNullOrWhiteSpace(name) && !name.Any(char.IsControl) && Encoding.UTF8.GetByteCount(name) <= MaxDeviceNameBytes;
 
     internal async Task StartAsync()
     {
@@ -54,10 +96,9 @@ internal sealed class BluetoothServer : IDisposable
         {
             CharacteristicProperties = GattCharacteristicProperties.Indicate
         });
-        await AddCharacteristic(service, NameId, new()
+        var name = await AddCharacteristic(service, NameId, new()
         {
             CharacteristicProperties = GattCharacteristicProperties.Read,
-            StaticValue = MakeBuffer(Encoding.UTF8.GetBytes(Environment.MachineName)),
             ReadProtectionLevel = GattProtectionLevel.Plain
         });
 
@@ -66,6 +107,8 @@ internal sealed class BluetoothServer : IDisposable
         provider = service;
         upload = write;
         download = indicate;
+        nameCharacteristic = name;
+        name.ReadRequested += OnNameRead;
         upload.WriteRequested += OnWrite;
         download.SubscribedClientsChanged += OnSubscribersChanged;
         provider.AdvertisementStatusChanged += OnAdvertisementStatusChanged;
@@ -75,6 +118,20 @@ internal sealed class BluetoothServer : IDisposable
             IsDiscoverable = true
         });
         ReportStatus(provider.AdvertisementStatus, BluetoothError.Success);
+    }
+
+    private async void OnNameRead(GattLocalCharacteristic sender, GattReadRequestedEventArgs args)
+    {
+        using var deferral = args.GetDeferral();
+        try
+        {
+            var request = await args.GetRequestAsync();
+            request?.RespondWithValue(MakeBuffer(Encoding.UTF8.GetBytes(DeviceName)));
+        }
+        catch (Exception error)
+        {
+            Debug.WriteLine(error);
+        }
     }
 
     private static async Task<GattLocalCharacteristic> AddCharacteristic(
@@ -101,8 +158,9 @@ internal sealed class BluetoothServer : IDisposable
         }
     }
 
-    internal async Task SendAsync(Peer peer, Transfer transfer, IProgress<int> progress)
+    internal async Task SendAsync(Peer peer, Transfer transfer, IProgress<int> progress, CancellationToken cancellation)
     {
+        cancellation.ThrowIfCancellationRequested();
         var characteristic = download ?? throw new InvalidOperationException("Bluetooth is still starting.");
         var client = characteristic.SubscribedClients.FirstOrDefault(item => item.Session.DeviceId.Id == peer.Id)
             ?? throw new IOException("The Apple device disconnected. Open Pipopu and try again.");
@@ -118,22 +176,34 @@ internal sealed class BluetoothServer : IDisposable
 
         try
         {
-            await Indicate(Frame.Control(Frame.Begin, token, data.Length));
-            int offset = 0;
-            while (offset < data.Length)
+            try
             {
-                int capacity = client.MaxNotificationSize - 1;
-                if (capacity <= 0)
-                    throw new IOException("The Bluetooth connection closed.");
-                int count = Math.Min(capacity, data.Length - offset);
-                byte[] frame = new byte[count + 1];
-                frame[0] = Frame.Chunk;
-                data.AsSpan(offset, count).CopyTo(frame.AsSpan(1));
-                await Indicate(frame);
-                offset += count;
-                progress.Report(offset * 100 / data.Length);
+                await Indicate(Frame.Control(Frame.Begin, token, data.Length), cancellation);
+                int offset = 0;
+                while (offset < data.Length)
+                {
+                    int capacity = client.MaxNotificationSize - 1;
+                    if (capacity <= 0)
+                        throw new IOException("The Bluetooth connection closed.");
+                    int count = Math.Min(capacity, data.Length - offset);
+                    byte[] frame = new byte[count + 1];
+                    frame[0] = Frame.Chunk;
+                    data.AsSpan(offset, count).CopyTo(frame.AsSpan(1));
+                    await Indicate(frame, cancellation);
+                    offset += count;
+                    progress.Report(offset * 100 / data.Length);
+                }
+                cancellation.ThrowIfCancellationRequested();
             }
-            await Indicate(Frame.Control(Frame.End, token));
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+            {
+                // A peer may have already received some chunks. Ask it to discard them.
+                try { await Indicate(Frame.Control(Frame.Abort, token), CancellationToken.None, timeoutSeconds: 1); }
+                catch (Exception error) { Debug.WriteLine(error); }
+                throw;
+            }
+
+            await Indicate(Frame.Control(Frame.End, token), CancellationToken.None);
             await pending.Completion.Task.WaitAsync(TimeSpan.FromSeconds(15));
         }
         finally
@@ -142,12 +212,15 @@ internal sealed class BluetoothServer : IDisposable
                 outgoing.Remove(peer.Id);
         }
 
-        async Task Indicate(byte[] frame)
+        async Task Indicate(byte[] frame, CancellationToken cancellationToken, int timeoutSeconds = 15)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (frame.Length > client.MaxNotificationSize || pending.Completion.Task.IsCanceled)
                 throw new IOException("The Bluetooth connection closed.");
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
             var result = await characteristic.NotifyValueAsync(MakeBuffer(frame), client).AsTask(timeout.Token);
+            cancellationToken.ThrowIfCancellationRequested();
             if (result.Status != GattCommunicationStatus.Success)
                 throw new IOException($"Bluetooth delivery failed ({result.Status}).");
         }
@@ -240,7 +313,7 @@ internal sealed class BluetoothServer : IDisposable
     {
         string message = status switch
         {
-            GattServiceProviderAdvertisementStatus.Started => "Available over Bluetooth",
+            GattServiceProviderAdvertisementStatus.Started => "Bluetooth ready",
             GattServiceProviderAdvertisementStatus.StartedWithoutAllAdvertisementData =>
                 "Bluetooth advertising is limited by the adapter.",
             GattServiceProviderAdvertisementStatus.Aborted => $"Bluetooth advertising stopped ({error}).",
@@ -274,6 +347,8 @@ internal sealed class BluetoothServer : IDisposable
             upload.WriteRequested -= OnWrite;
         if (download is not null)
             download.SubscribedClientsChanged -= OnSubscribersChanged;
+        if (nameCharacteristic is not null)
+            nameCharacteristic.ReadRequested -= OnNameRead;
         if (provider is not null)
         {
             provider.AdvertisementStatusChanged -= OnAdvertisementStatusChanged;

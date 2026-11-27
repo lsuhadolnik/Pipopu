@@ -3,7 +3,7 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:local="clr-namespace:Pipopu"
     Foreground="{DynamicResource TextFillColorPrimaryBrush}">
-  <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,0,0,20">
+  <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
     <Grid Width="154" Height="154" HorizontalAlignment="Center" Margin="0,0,0,9">
       <local:TransferArc Progress="1" Stroke="{DynamicResource ControlStrokeColorDefaultBrush}" StrokeThickness="6"
                          StrokeStartLineCap="Round" StrokeEndLineCap="Round" />
@@ -17,5 +17,7 @@
                TextTrimming="CharacterEllipsis" TextAlignment="Center" />
     <TextBlock x:Name="Status" Style="{DynamicResource SecondaryText}" TextAlignment="Center" Margin="0,9,0,0"
                AutomationProperties.LiveSetting="Polite" />
+    <Button x:Name="CancelButton" Content="Cancel" HorizontalAlignment="Center" MinWidth="82"
+            Margin="0,12,0,0" Click="CancelClick" />
   </StackPanel>
 </UserControl>

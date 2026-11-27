@@ -9,6 +9,7 @@ namespace Pipopu;
 internal partial class SendProgressView : UserControl, IProgress<int>
 {
     private int lastPercentage;
+    internal event Action? CancelRequested;
 
     public SendProgressView() => InitializeComponent();
 
@@ -21,6 +22,8 @@ internal partial class SendProgressView : UserControl, IProgress<int>
         HeadingText.Text = "Sending";
         DeviceText.Text = deviceName;
         Status.Text = "Connecting over Bluetooth…";
+        CancelButton.Visibility = Visibility.Visible;
+        CancelButton.IsEnabled = true;
         Visibility = Visibility.Visible;
     }
 
@@ -29,6 +32,8 @@ internal partial class SendProgressView : UserControl, IProgress<int>
         if (percentage == lastPercentage)
             return;
         lastPercentage = percentage;
+        if (percentage == 100)
+            CancelButton.IsEnabled = false;
         AnimateTo(Math.Min(96, percentage) / 100d);
         Status.Text = percentage == 100 ? "Waiting for delivery confirmation…" : $"{percentage}% sent";
     }
@@ -38,7 +43,15 @@ internal partial class SendProgressView : UserControl, IProgress<int>
         HeadingText.Text = "Delivered";
         Glyph.Text = "\uE73E";
         Status.Text = "The device confirmed receipt.";
+        CancelButton.Visibility = Visibility.Hidden;
         AnimateTo(1);
+    }
+
+    private void CancelClick(object sender, RoutedEventArgs e)
+    {
+        CancelButton.IsEnabled = false;
+        Status.Text = "Cancelling…";
+        CancelRequested?.Invoke();
     }
 
     private void AnimateTo(double value)

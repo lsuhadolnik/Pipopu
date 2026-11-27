@@ -59,6 +59,7 @@ internal static class Frame
     internal const byte End = 3;
     internal const byte Received = 4;
     internal const byte Available = 5;
+    internal const byte Abort = 6;
 
     internal static byte[] Control(byte opcode, uint token, int? length = null)
     {

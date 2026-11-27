@@ -64,6 +64,7 @@ enum Frame {
     static let end: UInt8 = 3
     static let received: UInt8 = 4
     static let available: UInt8 = 5
+    static let abort: UInt8 = 6
 
     static func number(_ value: UInt32) -> [UInt8] {
         (0..<4).map { UInt8(truncatingIfNeeded: value >> ($0 * 8)) }

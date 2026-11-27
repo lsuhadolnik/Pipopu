@@ -19,7 +19,9 @@ dotnet publish windows/Pipopu/Pipopu.csproj -c Release -p:PublishProfile=Windows
 
 Closing the window keeps the app in the notification area. Click the tray icon to reopen it or right-click and choose **Exit** to stop advertising. On receipt, Pipopu opens a popup to copy text or an image, or save an image or file.
 
-To send, paste text or an image, or drop a single image or file. Select the iPhone or iPad below and click **Send**. Open Pipopu on the Apple device first and keep **Available to receive** enabled. The Apple app displays the received text or image and lets you save files through the Files picker.
+Click the name next to the Bluetooth icon to change how this PC appears to nearby Apple devices.
+
+To send, paste text or an image, or drop a single image or file. Select the iPhone or iPad below and click **Send**. Use **Cancel** while data is sending to stop the transfer and keep your draft. Open Pipopu on the Apple device first and keep **Available to receive** enabled. The Apple app displays the received text or image and lets you save files through the Files picker.
 
 ## Run and debug on iPhone or iPad
 
@@ -56,7 +58,7 @@ Service and characteristic UUIDs share the suffix `-8B6E-44DA-BEEC-E10D5680D630`
 | `EA259A32` | Windows-to-Apple indications |
 | `EA259A33` | Readable UTF-8 PC name |
 
-A transfer consists of a start frame (opcode `01`, 32-bit token, 32-bit envelope length), one or more data frames (opcode `02` and envelope bytes), and an end frame (opcode `03` and the token). The envelope contains the type byte (1 text, 2 image, 3 file), a 16-bit UTF-8 filename length, up to 255 filename bytes, up to 3,000,000 payload bytes, and the 32-byte SHA-256 digest of all preceding envelope bytes. Integers are little-endian. Windows acknowledges successful receipt through the end-frame write response. Apple writes opcode `04` with the token after validating a download, and opcode `05` with its UTF-8 display label after subscribing.
+A transfer consists of a start frame (opcode `01`, 32-bit token, 32-bit envelope length), one or more data frames (opcode `02` and envelope bytes), and an end frame (opcode `03` and the token). The envelope contains the type byte (1 text, 2 image, 3 file), a 16-bit UTF-8 filename length, up to 255 filename bytes, up to 3,000,000 payload bytes, and the 32-byte SHA-256 digest of all preceding envelope bytes. Integers are little-endian. Windows acknowledges successful receipt through the end-frame write response. Apple writes opcode `04` with the token after validating a download, and opcode `05` with its UTF-8 display label after subscribing. When the user cancels a download before its end frame, Windows sends opcode `06` with the token so Apple can discard the partial transfer.
 
 ### Hardware smoke test
 

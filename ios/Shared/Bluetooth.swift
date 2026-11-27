@@ -282,6 +282,9 @@ extension Bluetooth: CBPeripheralDelegate {
             switch opcode {
             case Frame.begin: link.incoming = try IncomingTransfer(frame)
             case Frame.chunk: try link.incoming?.append(frame)
+            case Frame.abort:
+                guard frame.count == 5, link.incoming?.token == Frame.readNumber(frame, at: 1) else { return }
+                link.incoming = nil
             case Frame.end:
                 guard let incoming = link.incoming else { return }
                 received = try incoming.finish(frame)

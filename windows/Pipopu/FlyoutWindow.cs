@@ -91,21 +91,20 @@ public class FlyoutWindow : Window
         base.OnSourceInitialized(e);
         source = HwndSource.FromHwnd(new WindowInteropHelper(this).Handle);
         source.AddHook(WindowMessage);
-        ApplyBackdrop();
+        ApplySurface();
     }
 
-    private void ApplyBackdrop()
+    private void ApplySurface()
     {
         if (source?.CompositionTarget is not { } target)
             return;
 
-        IntPtr handle = source.Handle;
         if (OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
         {
-            int dark = TryFindResource("TextFillColorPrimaryBrush") is SolidColorBrush foreground
-                && foreground.Color.R > 127 ? 1 : 0;
-            DwmSetWindowAttribute(handle, DwmImmersiveDarkMode, dark, sizeof(int));
-            DwmSetWindowAttribute(handle, DwmWindowCornerPreference, DwmRound, sizeof(int));
+            int dark = TryFindResource("TextFillColorPrimaryBrush") is SolidColorBrush foreground &&
+                foreground.Color.R > 127 ? 1 : 0;
+            DwmSetWindowAttribute(source.Handle, DwmImmersiveDarkMode, dark, sizeof(int));
+            DwmSetWindowAttribute(source.Handle, DwmWindowCornerPreference, DwmRound, sizeof(int));
         }
 
         bool acrylic = false;
@@ -113,15 +112,15 @@ public class FlyoutWindow : Window
         {
             int backdrop = SystemParameters.HighContrast ? DwmNoBackdrop : DwmDesktopAcrylic;
             var margins = new Margins(backdrop == DwmDesktopAcrylic ? -1 : 0);
-            acrylic = DwmSetWindowAttribute(handle, DwmSystemBackdropType, backdrop, sizeof(int)) >= 0 &&
-                DwmExtendFrameIntoClientArea(handle, in margins) >= 0 && backdrop == DwmDesktopAcrylic;
+            acrylic = DwmSetWindowAttribute(source.Handle, DwmSystemBackdropType, backdrop, sizeof(int)) >= 0 &&
+                DwmExtendFrameIntoClientArea(source.Handle, in margins) >= 0 && backdrop == DwmDesktopAcrylic;
         }
 
+        target.BackgroundColor = acrylic ? Colors.Transparent : Colors.Black;
         if (acrylic)
             Background = Brushes.Transparent;
         else
             SetResourceReference(BackgroundProperty, "SolidBackgroundFillColorBaseBrush");
-        target.BackgroundColor = acrylic ? Colors.Transparent : Colors.Black;
     }
 
     private IntPtr WindowMessage(IntPtr handle, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -131,7 +130,7 @@ public class FlyoutWindow : Window
             Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () =>
             {
                 if (message is WmSettingChange or WmDwmCompositionChanged)
-                    ApplyBackdrop();
+                    ApplySurface();
                 if (IsVisible && !entrance.IsEnabled)
                     MoveToCorner();
             });

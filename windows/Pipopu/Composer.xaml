@@ -2,10 +2,10 @@
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:local="clr-namespace:Pipopu"
-    Title="Pipopu" Height="454" Width="414" AllowDrop="True"
+    Title="Pipopu" Height="380" Width="414" AllowDrop="True"
     FontFamily="{DynamicResource BodyFont}" FontSize="14"
     Foreground="{DynamicResource TextFillColorPrimaryBrush}">
-  <Grid Margin="24,14,24,20">
+  <Grid Margin="24,6,24,10">
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto" />
       <RowDefinition Height="*" />
@@ -18,30 +18,41 @@
       </StackPanel>
     </DockPanel>
 
-    <Grid x:Name="ComposeView" Grid.Row="1" Margin="0,14,0,0">
+    <Grid x:Name="ComposeView" Grid.Row="1" Margin="0,8,0,0">
       <Grid.RowDefinitions>
         <RowDefinition Height="Auto" />
         <RowDefinition Height="Auto" />
         <RowDefinition Height="*" />
         <RowDefinition Height="Auto" />
       </Grid.RowDefinitions>
-      <StackPanel>
-        <TextBlock Style="{DynamicResource Heading}" Text="Send nearby" />
-        <StackPanel Orientation="Horizontal" Margin="0,5,0,0">
-          <TextBlock Text="&#xE702;" FontFamily="{DynamicResource SymbolFont}" FontSize="13"
-                     VerticalAlignment="Center" Margin="0,0,7,0"
+      <DockPanel LastChildFill="True" MinHeight="28">
+        <TextBlock DockPanel.Dock="Left" Text="Send nearby" FontSize="17" FontWeight="SemiBold"
+                   VerticalAlignment="Center" Margin="0,0,18,0" />
+        <DockPanel HorizontalAlignment="Right" LastChildFill="True">
+          <TextBlock x:Name="BluetoothIndicator" DockPanel.Dock="Left"
+                     Text="&#xE702;" FontFamily="{DynamicResource SymbolFont}" FontSize="13"
+                     VerticalAlignment="Center" Margin="0,0,6,0" ToolTip="Starting Bluetooth…"
                      Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" />
-          <TextBlock x:Name="BluetoothStatus" Style="{DynamicResource SecondaryText}" VerticalAlignment="Center"
-                     Width="336" TextWrapping="Wrap" Text="Starting Bluetooth…" />
-        </StackPanel>
-      </StackPanel>
+          <Grid Width="192">
+            <Button x:Name="NameButton" Style="{DynamicResource QuietButton}" Click="RenameClick"
+                    HorizontalAlignment="Left" Padding="2,0" MinHeight="28" MaxWidth="192"
+                    ToolTip="Change the name nearby Apple devices see">
+              <TextBlock x:Name="NameLabel" Style="{DynamicResource SecondaryText}"
+                         TextTrimming="CharacterEllipsis" TextDecorations="Underline" />
+            </Button>
+            <TextBox x:Name="NameEdit" Style="{DynamicResource UnderlineInput}" Visibility="Collapsed"
+                     Padding="2,3" MaxLength="64" VerticalContentAlignment="Center"
+                     LostKeyboardFocus="NameEditLostFocus" AutomationProperties.Name="Device name" />
+          </Grid>
+        </DockPanel>
+      </DockPanel>
 
-      <StackPanel Grid.Row="1" Margin="0,19,0,0">
+      <StackPanel Grid.Row="1" Margin="0,17,0,0">
         <Grid>
-          <TextBox x:Name="Message" Height="94" Padding="11,8" AcceptsReturn="True"
+          <TextBox x:Name="Message" Style="{DynamicResource UnderlineInput}" Height="90" AcceptsReturn="True"
                    TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
                    AutomationProperties.Name="Message" TextChanged="RefreshSend" />
-          <TextBlock Text="Type or paste a message" IsHitTestVisible="False" Margin="12,9,0,0">
+          <TextBlock Text="Type or paste a message" IsHitTestVisible="False" Margin="2,7,0,0">
             <TextBlock.Style>
               <Style TargetType="TextBlock" BasedOn="{StaticResource SecondaryText}">
                 <Setter Property="Visibility" Value="Collapsed" />
