@@ -82,7 +82,7 @@
                   Style="{DynamicResource QuietButton}" Click="ClearClick" />
         </StackPanel>
         <TextBlock x:Name="AttachmentLabel" Style="{DynamicResource SecondaryText}" Margin="2,0,0,0"
-                   TextTrimming="CharacterEllipsis" Text="Drop an image or file up to 3 MB" />
+                   TextTrimming="CharacterEllipsis" Text="Drop an image or file up to 5 GB" />
       </StackPanel>
 
       <Grid Grid.Row="2" Margin="0,17,0,9">

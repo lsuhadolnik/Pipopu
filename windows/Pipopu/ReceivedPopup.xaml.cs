@@ -15,6 +15,7 @@ internal partial class ReceivedPopup : FlyoutWindow
     {
         this.transfer = transfer;
         InitializeComponent();
+        Closed += (_, _) => transfer.File?.Dispose();
 
         HeadingText.Text = transfer.Kind switch
         {
@@ -27,7 +28,7 @@ internal partial class ReceivedPopup : FlyoutWindow
         {
             try
             {
-                using var stream = new MemoryStream(transfer.Data);
+                using var stream = transfer.OpenRead();
                 var frame = BitmapFrame.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.None);
                 if ((long)frame.PixelWidth * frame.PixelHeight > 32_000_000)
                     throw new InvalidDataException("This image is too large to preview.");
@@ -81,7 +82,9 @@ internal partial class ReceivedPopup : FlyoutWindow
         var picker = new SaveFileDialog { FileName = name };
         if (picker.ShowDialog(this) == true)
         {
-            File.WriteAllBytes(picker.FileName, transfer.Data);
+            using var source = transfer.OpenRead();
+            using var destination = File.Create(picker.FileName);
+            source.CopyTo(destination);
             Status.Text = "Saved";
         }
     });

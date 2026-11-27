@@ -1,12 +1,16 @@
 import Combine
 import CoreBluetooth
+import CryptoKit
 import Foundation
+import Security
+import UIKit
 
-private let serviceID = CBUUID(string: "EA259A30-8B6E-44DA-BEEC-E10D5680D630")
-private let uploadID = CBUUID(string: "EA259A31-8B6E-44DA-BEEC-E10D5680D630")
-private let downloadID = CBUUID(string: "EA259A32-8B6E-44DA-BEEC-E10D5680D630")
-private let nameID = CBUUID(string: "EA259A33-8B6E-44DA-BEEC-E10D5680D630")
+private let serviceID = CBUUID(string: "EA259A40-8B6E-44DA-BEEC-E10D5680D630")
+private let uploadID = CBUUID(string: "EA259A41-8B6E-44DA-BEEC-E10D5680D630")
+private let downloadID = CBUUID(string: "EA259A42-8B6E-44DA-BEEC-E10D5680D630")
+private let nameID = CBUUID(string: "EA259A43-8B6E-44DA-BEEC-E10D5680D630")
 
+@MainActor
 final class Bluetooth: NSObject, ObservableObject {
     struct Peer: Identifiable {
         let id: UUID
@@ -14,11 +18,50 @@ final class Bluetooth: NSObject, ObservableObject {
         var connected = false
     }
 
-    private enum WritePurpose { case send, registration, acknowledgement }
+    struct Pairing {
+        let name: String
+        let code: String
+    }
 
-    private struct PendingWrite {
-        let frame: Data
-        let purpose: WritePurpose
+    private final class Write {
+        let packet: Data
+        let token = UInt32.random(in: .min ... .max)
+        let continuation: CheckedContinuation<Void, Error>
+        let progress: ((Double) -> Void)?
+        var offset = 0
+        var started = false
+        var ended = false
+
+        init(_ packet: Data, continuation: CheckedContinuation<Void, Error>, progress: ((Double) -> Void)?) {
+            self.packet = packet
+            self.continuation = continuation
+            self.progress = progress
+        }
+    }
+
+    private final class Transaction {
+        let id: String
+        let incoming: AsyncThrowingStream<Wire, Error>.Continuation
+        private var iterator: AsyncThrowingStream<Wire, Error>.Iterator
+        var deadline = Date().addingTimeInterval(120)
+
+        init(id: String) {
+            self.id = id
+            let stream = AsyncThrowingStream<Wire, Error>.makeStream(bufferingPolicy: .bufferingOldest(8))
+            incoming = stream.continuation
+            iterator = stream.stream.makeAsyncIterator()
+        }
+
+        func next() async throws -> Wire {
+            var cursor = iterator
+            let message = try await cursor.next()
+            iterator = cursor
+            guard let message else { throw TransferError.disconnected }
+            if message.type == "fail" {
+                throw TransferError.message(message.error ?? "The PC declined the transfer.")
+            }
+            return message
+        }
     }
 
     private final class Link {
@@ -28,29 +71,20 @@ final class Bluetooth: NSObject, ObservableObject {
         var connectingSince: Date?
         var upload: CBCharacteristic?
         var download: CBCharacteristic?
-        var writing: WritePurpose?
-        var pendingWrites: [PendingWrite] = []
-        var nameCharacteristic: CBCharacteristic?
-        var nextNameRead = Date.distantPast
-        var hasServiceName = false
-        var incoming: IncomingTransfer?
+        var incoming: IncomingPacket?
         var incomingAt = Date.distantPast
+        var hello: Data?
+        var session: SecureSession?
+        var writes: [Write] = []
+        var writeAt = Date.distantPast
+        var nextNameRefresh = Date.distantPast
+        var transfer: Transaction?
+        var task: Task<Void, Never>?
 
         init(_ peripheral: CBPeripheral, name: String) {
             self.peripheral = peripheral
             peer = Peer(id: peripheral.identifier, name: name)
         }
-    }
-
-    private struct Send {
-        let id: UUID
-        let token = UInt32.random(in: .min ... .max)
-        let data: Data
-        let onFinish: () -> Void
-        var offset = 0
-        var started = false
-        var ended = false
-        var lastActivity = Date()
     }
 
     @Published private(set) var peers = [Peer]()
@@ -60,64 +94,272 @@ final class Bluetooth: NSObject, ObservableObject {
     @Published private(set) var received: Transfer?
     @Published private(set) var receiveError: String?
     @Published private(set) var sendCompleted = false
+    @Published private(set) var pairing: Pairing?
+    @Published private(set) var pairingCode: String?
+    @Published private(set) var trustedDevices = TrustStore.all()
 
     private var central: CBCentralManager?
     private var links = [UUID: Link]()
     private var timer: Timer?
     private var receivingName: String?
-    private var send: Send?
+    private var identity: P256.KeyAgreement.PrivateKey?
+    private var sender: UUID?
+    private var confirmation: (Link, CheckedContinuation<Bool, Never>)?
 
     func start(receivingAs name: String? = nil) {
         guard central == nil else { return }
+        do { identity = try TrustStore.identity() }
+        catch { state = error.localizedDescription; return }
         receivingName = name
+        trustedDevices = TrustStore.all()
         central = CBCentralManager(delegate: self, queue: .main)
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.tick() }
+        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tick() }
+        }
     }
 
     func stop() {
         timer?.invalidate()
         timer = nil
         central?.stopScan()
-        for link in links.values { central?.cancelPeripheralConnection(link.peripheral) }
+        for link in Array(links.values) {
+            disconnect(link)
+            central?.cancelPeripheralConnection(link.peripheral)
+        }
         central?.delegate = nil
         central = nil
         links.removeAll()
         peers = []
-        send = nil
-        progress = nil
+        pairingCode = nil
     }
 
     func clearReceived() { received = nil }
 
     func updateReceivingName(_ name: String?) {
         guard receivingName != name else { return }
-        let availabilityChanged = (receivingName == nil) != (name == nil)
         receivingName = name
-        for link in links.values where link.peripheral.state == .connected {
-            guard let download = link.download else { continue }
-            if availabilityChanged {
-                link.peripheral.setNotifyValue(name != nil, for: download)
-            } else if let name, download.isNotifying {
-                announce(name, on: link)
+        for link in links.values { link.nextNameRefresh = .distantPast }
+        tick()
+    }
+
+    func forget(_ peer: PeerTrust) {
+        do {
+            try TrustStore.forget(peer.id)
+            trustedDevices = TrustStore.all()
+            for link in links.values where link.session?.identity == peer.id && link.transfer != nil {
+                central?.cancelPeripheralConnection(link.peripheral)
+            }
+        } catch { result = error.localizedDescription }
+    }
+
+    func answerPairing(_ accepted: Bool) {
+        let pending = confirmation
+        confirmation = nil
+        pairing = nil
+        pending?.1.resume(returning: accepted)
+    }
+
+    func send(_ transfer: Transfer, to id: UUID, onFinish: @escaping () -> Void) {
+        guard sender == nil, let link = links[id], link.peer.connected, link.transfer == nil,
+              let session = link.session else {
+            sendCompleted = false
+            result = TransferError.message("The selected PC is disconnected or busy.").localizedDescription
+            onFinish()
+            return
+        }
+        sender = id
+        sendCompleted = false
+        result = nil
+        progress = 0
+        let transaction = Transaction(id: UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())
+        link.transfer = transaction
+        link.task = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                finish(link, transaction)
+                sender = nil
+                progress = nil
+                pairingCode = nil
+                onFinish()
+            }
+            do {
+                let pair = !TrustStore.contains(session.identity)
+                let offer = Wire(type: "offer", id: transaction.id, name: transfer.name, kind: Int(transfer.kind.rawValue),
+                                 size: transfer.size, pair: pair)
+                try await transmit(offer, on: link)
+                let review = try await transaction.next()
+                try expect(review, "review")
+                if pair || review.pair == true {
+                    pairingCode = session.code
+                    try await confirmTrust(link, session: session)
+                }
+                try expect(await transaction.next(), "accept")
+                pairingCode = nil
+                try await transmit(Wire(type: "verified", id: transaction.id), on: link)
+                if pair || review.pair == true {
+                    try TrustStore.remember(session.identity, name: link.peer.name)
+                    trustedDevices = TrustStore.all()
+                }
+                transaction.deadline = Date().addingTimeInterval(7200)
+                if transfer.size > Int64(Transfer.limit) {
+                    let file: TemporaryFile
+                    if let existing = transfer.file {
+                        file = existing
+                    } else {
+                        file = TemporaryFile(size: transfer.size)
+                        try transfer.data.write(to: file.url)
+                    }
+                    let input = try FileHandle(forReadingFrom: file.url)
+                    defer { try? input.close() }
+                    let encrypted = try await FileCipher.transform(input: input, size: transfer.size,
+                        key: session.key(for: transaction.id), encrypt: true)
+                    let route = try await transaction.next()
+                    try await upload(encrypted, route: route, link: link, transaction: transaction)
+                    try await transmit(Wire(type: "uploaded", id: transaction.id), on: link)
+                } else {
+                    try await transmit(Wire(type: "data", id: transaction.id, data: transfer.data), on: link) {
+                        [weak self] value in self?.progress = value * 0.95
+                    }
+                }
+                try expect(await transaction.next(), "complete")
+                sendCompleted = true
+                result = "Sent"
+            } catch {
+                result = error.localizedDescription
+                if !Task.isCancelled && link.peer.connected {
+                    try? await transmit(Wire(type: "cancel", id: transaction.id), on: link)
+                }
             }
         }
     }
 
-    func send(_ transfer: Transfer, to id: UUID, onFinish: @escaping () -> Void) {
-        guard send == nil else { return }
-        sendCompleted = false
-        guard let link = links[id] else {
-            result = TransferError.disconnected.localizedDescription
-            onFinish()
+    private func upload(_ encrypted: TemporaryFile, route: Wire, link: Link, transaction: Transaction) async throws {
+        try expect(route, "route")
+        if route.route == "lan" {
+            do {
+                let url = try await BulkNetwork.localURL(route.urls ?? [])
+                try await BulkNetwork.uploadLocal(url, file: encrypted) { [weak self] value in
+                    guard link.transfer === transaction else { return }
+                    self?.progress = value
+                }
+                progress = 0.95
+                return
+            } catch {
+                try Task.checkCancellation()
+                try await transmit(Wire(type: "fallback", id: transaction.id), on: link)
+                let next = try await transaction.next()
+                try expect(next, "route")
+                guard next.route == "cloud" else { throw TransferError.invalid }
+                try await BulkNetwork.uploadCloud(BulkNetwork.cloudURL(next), file: encrypted) { [weak self] in
+                    self?.progress = $0
+                }
+            }
+        } else if route.route == "cloud" {
+            try await BulkNetwork.uploadCloud(BulkNetwork.cloudURL(route), file: encrypted) { [weak self] in
+                self?.progress = $0
+            }
+        } else {
+            throw TransferError.invalid
+        }
+    }
+
+    private func receive(_ offer: Wire, on link: Link) {
+        guard let session = link.session, let id = offer.id, id.count == 32, id.allSatisfy({ $0.isHexDigit }),
+              let raw = offer.kind, let number = UInt8(exactly: raw), let kind = Transfer.Kind(rawValue: number),
+              let name = offer.name, name.utf8.count <= 255,
+              let size = offer.size, size >= 0, size <= Transfer.fileLimit,
+              kind != .text || size <= Int64(Transfer.textLimit) else { return }
+
+        guard receivingName != nil, link.transfer == nil, !links.values.contains(where: { $0.transfer != nil }) else {
+            Task { try? await transmit(Wire(type: "fail", id: id, error: "Pipopu is busy or unavailable to receive."), on: link) }
             return
         }
-        result = nil
-        progress = 0
-        send = Send(id: id, data: transfer.envelope(), onFinish: onFinish)
-        if link.upload != nil {
-            writeNext(link)
-        } else {
-            connect(link)
+
+        let transaction = Transaction(id: id)
+        receiveError = nil
+        link.transfer = transaction
+        link.task = Task { [weak self] in
+            guard let self else { return }
+            defer { finish(link, transaction) }
+            do {
+                let pair = offer.pair == true || !TrustStore.contains(session.identity)
+                try await transmit(Wire(type: "review", id: id, pair: pair), on: link)
+                if pair { try await confirmTrust(link, session: session) }
+                try await transmit(Wire(type: "accept", id: id), on: link)
+                try expect(await transaction.next(), "verified")
+                if pair {
+                    try TrustStore.remember(session.identity, name: link.peer.name)
+                    trustedDevices = TrustStore.all()
+                }
+                transaction.deadline = Date().addingTimeInterval(7200)
+                let message = try await transaction.next()
+                let transfer: Transfer
+                if size <= Int64(Transfer.limit) {
+                    try expect(message, "data")
+                    guard let data = message.data, Int64(data.count) == size else { throw TransferError.invalid }
+                    transfer = try Transfer(kind: kind, name: name, data: data)
+                } else {
+                    let encrypted = try await download(message, link: link, transaction: transaction,
+                                                       size: FileCipher.encryptedSize(size))
+                    let input = try FileHandle(forReadingFrom: encrypted.url)
+                    defer { try? input.close() }
+                    let clear = try await FileCipher.transform(input: input, size: size, key: session.key(for: id), encrypt: false)
+                    if kind == .text {
+                        transfer = try Transfer(kind: kind, name: name, data: Data(contentsOf: clear.url))
+                    } else {
+                        transfer = try Transfer(kind: kind, name: name, data: Data(), file: clear)
+                    }
+                }
+                try Task.checkCancellation()
+                received = transfer
+                try await transmit(Wire(type: "complete", id: id), on: link)
+            } catch {
+                receiveError = error.localizedDescription
+                if !Task.isCancelled && link.peer.connected {
+                    try? await transmit(Wire(type: "fail", id: id, error: error.localizedDescription), on: link)
+                }
+            }
+        }
+    }
+
+    private func download(_ route: Wire, link: Link, transaction: Transaction, size: Int64) async throws -> TemporaryFile {
+        try expect(route, "route")
+        if route.route == "lan" {
+            do {
+                let url = try await BulkNetwork.localURL(route.urls ?? [])
+                return try await BulkNetwork.download(url, cloud: false, size: size)
+            } catch {
+                try Task.checkCancellation()
+                try await transmit(Wire(type: "fallback", id: transaction.id), on: link)
+                let next = try await transaction.next()
+                try expect(next, "route")
+                guard next.route == "cloud" else { throw TransferError.invalid }
+                return try await BulkNetwork.download(BulkNetwork.cloudURL(next), cloud: true, size: size)
+            }
+        }
+        guard route.route == "cloud" else { throw TransferError.invalid }
+        return try await BulkNetwork.download(BulkNetwork.cloudURL(route), cloud: true, size: size)
+    }
+
+    private func expect(_ message: Wire, _ type: String) throws {
+        guard message.type == type else { throw TransferError.invalid }
+    }
+
+    private func confirmTrust(_ link: Link, session: SecureSession) async throws {
+        guard confirmation == nil else { throw TransferError.message("A pairing request is already open.") }
+        let accepted = await withCheckedContinuation { continuation in
+            confirmation = (link, continuation)
+            pairing = Pairing(name: link.peer.name, code: session.code)
+        }
+        guard accepted else { throw TransferError.message("The pairing request was declined.") }
+        try Task.checkCancellation()
+    }
+
+    private func finish(_ link: Link, _ transaction: Transaction) {
+        transaction.incoming.finish()
+        if link.transfer === transaction {
+            link.transfer = nil
+            link.task = nil
         }
     }
 
@@ -136,111 +378,127 @@ final class Bluetooth: NSObject, ObservableObject {
     }
 
     private func tick() {
-        if let active = send, Date().timeIntervalSince(active.lastActivity) > 20 {
-            finish(TransferError.timedOut)
-            if let link = links[active.id] { central?.cancelPeripheralConnection(link.peripheral) }
-        }
+        let now = Date()
         for (id, link) in Array(links) {
-            if let started = link.connectingSince, Date().timeIntervalSince(started) > 18 {
-                link.connectingSince = nil
+            if let transaction = link.transfer, now > transaction.deadline {
+                transaction.incoming.finish(throwing: TransferError.timedOut)
+                link.task?.cancel()
+                if confirmation?.0 === link { answerPairing(false) }
                 central?.cancelPeripheralConnection(link.peripheral)
             }
-            if Date().timeIntervalSince(link.incomingAt) > 30 { link.incoming = nil }
-            if send?.id != id, link.incoming == nil, Date() >= link.nextNameRead {
-                refreshName(of: link)
+            if let started = link.connectingSince, now.timeIntervalSince(started) > 18 {
+                central?.cancelPeripheralConnection(link.peripheral)
             }
-            if link.peripheral.state == .disconnected && send?.id != id &&
-                Date().timeIntervalSince(link.lastSeen) > 12 {
+            if now.timeIntervalSince(link.incomingAt) > 30 { link.incoming = nil }
+            if link.peer.connected && link.transfer == nil && now >= link.nextNameRefresh {
+                announce(on: link)
+            }
+            if !link.writes.isEmpty && now.timeIntervalSince(link.writeAt) > 18 {
+                central?.cancelPeripheralConnection(link.peripheral)
+            }
+            if link.peripheral.state == .disconnected && now.timeIntervalSince(link.lastSeen) > 12 {
                 links[id] = nil
             }
         }
         publishPeers()
     }
 
-    private func refreshName(of link: Link) {
-        guard link.peripheral.state == .connected, let characteristic = link.nameCharacteristic else { return }
-        link.nextNameRead = Date().addingTimeInterval(4)
-        link.peripheral.readValue(for: characteristic)
+    private func transmit(_ message: Wire, on link: Link, progress: ((Double) -> Void)? = nil) async throws {
+        try Task.checkCancellation()
+        guard let session = link.session else { throw TransferError.disconnected }
+        try await enqueue(try session.seal(message), on: link, progress: progress)
     }
 
-    private func announce(_ name: String, on link: Link) {
-        let peripheral = link.peripheral
-        guard peripheral.state == .connected, link.upload != nil else { return }
-        let capacity = min(64, peripheral.maximumWriteValueLength(for: .withoutResponse) - 1)
-        guard capacity > 0 else { return }
-        var bytes = Data(name.utf8.prefix(capacity))
-        while String(data: bytes, encoding: .utf8) == nil { bytes.removeLast() }
-        write(Data([Frame.available]) + bytes, on: link, purpose: .registration)
-    }
-
-    private func write(_ frame: Data, on link: Link, purpose: WritePurpose) {
-        link.pendingWrites.append(PendingWrite(frame: frame, purpose: purpose))
-        flushWrites(on: link)
-    }
-
-    private func flushWrites(on link: Link) {
-        guard link.writing == nil, !link.pendingWrites.isEmpty,
-              link.peripheral.state == .connected, let upload = link.upload else { return }
-        let next = link.pendingWrites.removeFirst()
-        link.writing = next.purpose
-        link.peripheral.writeValue(next.frame, for: upload, type: .withResponse)
-    }
-
-    private func finish(_ error: Error? = nil) {
-        guard let outgoing = send else { return }
-        send = nil
-        progress = nil
-        result = error?.localizedDescription ?? "Sent"
-        sendCompleted = error == nil
-        outgoing.onFinish()
+    private func enqueue(_ packet: Data, on link: Link, progress: ((Double) -> Void)? = nil) async throws {
+        guard link.upload != nil else { throw TransferError.disconnected }
+        try await withCheckedThrowingContinuation { continuation in
+            link.writes.append(Write(packet, continuation: continuation, progress: progress))
+            if link.writes.count == 1 { writeNext(link) }
+        }
     }
 
     private func writeNext(_ link: Link) {
-        guard var outgoing = send, outgoing.id == link.peer.id, link.upload != nil else { return }
-        if outgoing.ended {
-            finish()
-            return
+        guard let upload = link.upload else { return }
+        if link.writes.first?.ended == true {
+            link.writes.removeFirst().continuation.resume()
         }
-
+        guard let write = link.writes.first else { return }
         let frame: Data
-        if !outgoing.started {
-            frame = Data([Frame.begin] + Frame.number(outgoing.token) + Frame.number(UInt32(outgoing.data.count)))
-            outgoing.started = true
-        } else if outgoing.offset < outgoing.data.count {
-            let capacity = min(
-                link.peripheral.maximumWriteValueLength(for: .withResponse),
-                link.peripheral.maximumWriteValueLength(for: .withoutResponse)
-            ) - 1
-            guard capacity > 0 else { finish(TransferError.disconnected); return }
-            let end = min(outgoing.offset + capacity, outgoing.data.count)
-            frame = Data([Frame.chunk]) + outgoing.data[outgoing.offset..<end]
-            outgoing.offset = end
-            progress = Double(end) / Double(outgoing.data.count)
+        if !write.started {
+            frame = Data([Frame.begin] + Frame.number(write.token) + Frame.number(UInt32(write.packet.count)))
+            write.started = true
+        } else if write.offset < write.packet.count {
+            let capacity = min(link.peripheral.maximumWriteValueLength(for: .withResponse),
+                               link.peripheral.maximumWriteValueLength(for: .withoutResponse)) - 1
+            guard capacity > 0 else { central?.cancelPeripheralConnection(link.peripheral); return }
+            let end = min(write.offset + capacity, write.packet.count)
+            frame = Data([Frame.chunk]) + write.packet[write.offset..<end]
+            write.offset = end
+            write.progress?(Double(end) / Double(write.packet.count))
         } else {
-            frame = Data([Frame.end] + Frame.number(outgoing.token))
-            outgoing.ended = true
+            frame = Data([Frame.end] + Frame.number(write.token))
+            write.ended = true
         }
-        outgoing.lastActivity = Date()
-        send = outgoing
-        write(frame, on: link, purpose: .send)
+        link.writeAt = Date()
+        link.peripheral.writeValue(frame, for: upload, type: .withResponse)
     }
 
-    private func clearLink(_ peripheral: CBPeripheral, error: Error?) {
-        guard let link = links[peripheral.identifier] else { return }
-        if send?.id == peripheral.identifier { finish(error ?? TransferError.disconnected) }
+    private func dispatch(_ packet: Data, on link: Link) throws {
+        if let session = link.session {
+            let message = try session.open(packet)
+            if message.type == "ready", let name = message.name {
+                link.peer.name = name
+                link.peer.connected = true
+                link.connectingSince = nil
+                publishPeers()
+            } else if message.type == "offer", link.peer.connected {
+                receive(message, on: link)
+            } else if let transaction = link.transfer, message.id == transaction.id {
+                if message.type == "cancel" {
+                    transaction.incoming.finish(throwing: TransferError.message("The PC cancelled the transfer."))
+                    link.task?.cancel()
+                    if confirmation?.0 === link { answerPairing(false) }
+                } else if case .dropped = transaction.incoming.yield(message) {
+                    transaction.incoming.finish(throwing: TransferError.invalid)
+                    link.task?.cancel()
+                }
+            }
+        } else {
+            guard let identity, let hello = link.hello else { throw TransferError.invalid }
+            link.session = try SecureSession(key: identity, hello: hello, welcome: packet)
+            announce(on: link)
+        }
+    }
+
+    private func announce(on link: Link) {
+        link.nextNameRefresh = Date().addingTimeInterval(4)
+        let device = receivingName ?? UIDevice.current.model
+        let name = String(decoding: device.utf8.prefix(60), as: UTF8.self)
+        Task {
+            do { try await transmit(Wire(type: "ready", name: name, receive: receivingName != nil), on: link) }
+            catch { central?.cancelPeripheralConnection(link.peripheral) }
+        }
+    }
+
+    private func disconnect(_ link: Link, error: Error? = nil) {
+        let failure = error ?? TransferError.disconnected
+        link.transfer?.incoming.finish(throwing: failure)
+        link.task?.cancel()
+        if confirmation?.0 === link { answerPairing(false) }
+        let writes = link.writes
+        link.writes.removeAll()
+        for write in writes { write.continuation.resume(throwing: failure) }
         link.connectingSince = nil
         link.upload = nil
         link.download = nil
-        link.writing = nil
-        link.pendingWrites.removeAll()
-        link.nameCharacteristic = nil
         link.incoming = nil
+        link.hello = nil
+        link.session = nil
         link.peer.connected = false
-        publishPeers()
     }
 }
 
-extension Bluetooth: CBCentralManagerDelegate {
+extension Bluetooth: @preconcurrency CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ manager: CBCentralManager) {
         switch manager.state {
         case .poweredOn:
@@ -252,15 +510,13 @@ extension Bluetooth: CBCentralManagerDelegate {
         case .unsupported: state = "Bluetooth LE is unavailable on this device."
         default: state = "Waiting for Bluetooth…"
         }
-        finish(TransferError.disconnected)
+        for link in links.values { disconnect(link) }
         links.removeAll()
         publishPeers()
     }
 
-    func centralManager(
-        _ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
-        advertisementData: [String: Any], rssi RSSI: NSNumber
-    ) {
+    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
+                        advertisementData: [String: Any], rssi RSSI: NSNumber) {
         if links[peripheral.identifier] == nil {
             guard links.count < 16 else { return }
             let name = advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? peripheral.name
@@ -270,9 +526,7 @@ extension Bluetooth: CBCentralManagerDelegate {
         }
         guard let link = links[peripheral.identifier] else { return }
         link.lastSeen = Date()
-        let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
-        updateFallbackName(advertisedName ?? peripheral.name, on: link)
-        connect(link)
+        if link.transfer == nil { connect(link) }
     }
 
     func centralManager(_ manager: CBCentralManager, didConnect peripheral: CBPeripheral) {
@@ -280,26 +534,17 @@ extension Bluetooth: CBCentralManagerDelegate {
     }
 
     func centralManager(_ manager: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        clearLink(peripheral, error: error)
+        centralManager(manager, didDisconnectPeripheral: peripheral, error: error)
     }
 
     func centralManager(_ manager: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        clearLink(peripheral, error: error)
+        guard let link = links[peripheral.identifier] else { return }
+        disconnect(link, error: error)
+        publishPeers()
     }
 }
 
-extension Bluetooth: CBPeripheralDelegate {
-    private func updateFallbackName(_ name: String?, on link: Link) {
-        guard !link.hasServiceName, let name, !name.isEmpty, name != link.peer.name else { return }
-        link.peer.name = name
-        publishPeers()
-    }
-
-    func peripheralDidUpdateName(_ peripheral: CBPeripheral) {
-        guard let link = links[peripheral.identifier] else { return }
-        updateFallbackName(peripheral.name, on: link)
-    }
-
+extension Bluetooth: @preconcurrency CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard error == nil, let service = peripheral.services?.first(where: { $0.uuid == serviceID }) else {
             central?.cancelPeripheralConnection(peripheral)
@@ -309,92 +554,68 @@ extension Bluetooth: CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        guard let link = links[peripheral.identifier], error == nil,
-              let chars = service.characteristics, let upload = chars.first(where: { $0.uuid == uploadID }),
-              upload.properties.contains(.write) else {
+        guard let link = links[peripheral.identifier], error == nil, let chars = service.characteristics,
+              let upload = chars.first(where: { $0.uuid == uploadID && $0.properties.contains(.write) }),
+              let download = chars.first(where: { $0.uuid == downloadID && $0.properties.contains(.indicate) }) else {
             central?.cancelPeripheralConnection(peripheral)
             return
         }
         link.upload = upload
-        link.download = chars.first(where: { $0.uuid == downloadID })
-        link.connectingSince = nil
-        link.nameCharacteristic = chars.first(where: { $0.uuid == nameID && $0.properties.contains(.read) })
-        refreshName(of: link)
-        if let download = link.download, receivingName != nil {
-            peripheral.setNotifyValue(true, for: download)
-        }
-        if send?.id == peripheral.identifier { writeNext(link) }
+        link.download = download
+        if let name = chars.first(where: { $0.uuid == nameID }) { peripheral.readValue(for: name) }
+        peripheral.setNotifyValue(true, for: download)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
-        guard let link = links[peripheral.identifier], characteristic.uuid == downloadID else { return }
-        guard error == nil else {
+        guard let link = links[peripheral.identifier], characteristic.uuid == downloadID,
+              characteristic.isNotifying, error == nil, let identity else {
             central?.cancelPeripheralConnection(peripheral)
             return
         }
-        if characteristic.isNotifying, let name = receivingName {
-            announce(name, on: link)
-        } else if !characteristic.isNotifying && link.peer.connected {
-            link.peer.connected = false
-            publishPeers()
+        var nonce = Data(count: 32)
+        let status = nonce.withUnsafeMutableBytes { buffer in SecRandomCopyBytes(kSecRandomDefault, 32, buffer.baseAddress!) }
+        guard status == errSecSuccess else { central?.cancelPeripheralConnection(peripheral); return }
+        let hello = Data([1]) + identity.publicKey.x963Representation + nonce
+        link.hello = hello
+        Task {
+            do { try await enqueue(hello, on: link) }
+            catch { central?.cancelPeripheralConnection(peripheral) }
         }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
-        guard let link = links[peripheral.identifier], characteristic.uuid == uploadID,
-              let purpose = link.writing else { return }
-        link.writing = nil
-        if let error {
-            if send?.id == peripheral.identifier { finish(error) }
-            link.pendingWrites.removeAll()
+        guard let link = links[peripheral.identifier], characteristic.uuid == uploadID else { return }
+        if error != nil {
+            disconnect(link, error: error)
             central?.cancelPeripheralConnection(peripheral)
-            return
-        }
-        switch purpose {
-        case .send:
+        } else {
             writeNext(link)
-        case .registration where receivingName != nil && !link.peer.connected:
-            link.peer.connected = true
-            publishPeers()
-        case .registration, .acknowledgement:
-            break
         }
-        flushWrites(on: link)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        guard let link = links[peripheral.identifier], error == nil,
-              let frame = characteristic.value, let opcode = frame.first else { return }
-        if characteristic.uuid == nameID {
-            guard let name = String(data: frame, encoding: .utf8), !name.isEmpty else { return }
-            link.hasServiceName = true
-            if name != link.peer.name {
-                link.peer.name = name
-                publishPeers()
-            }
+        guard let link = links[peripheral.identifier], error == nil, let frame = characteristic.value,
+              let opcode = frame.first else { return }
+        if characteristic.uuid == nameID && !link.peer.connected {
+            let name = String(decoding: frame, as: UTF8.self)
+            if !name.isEmpty { link.peer.name = name; publishPeers() }
             return
         }
-        guard characteristic.uuid == downloadID, link.upload != nil else { return }
+        guard characteristic.uuid == downloadID else { return }
         do {
             switch opcode {
-            case Frame.begin:
-                receiveError = nil
-                link.incoming = try IncomingTransfer(frame)
+            case Frame.begin: link.incoming = try IncomingPacket(frame)
             case Frame.chunk: try link.incoming?.append(frame)
-            case Frame.abort:
-                guard frame.count == 5, link.incoming?.token == Frame.readNumber(frame, at: 1) else { return }
-                link.incoming = nil
             case Frame.end:
-                guard let incoming = link.incoming else { return }
-                received = try incoming.finish(frame)
+                guard let packet = try link.incoming?.finish(frame) else { throw TransferError.invalid }
                 link.incoming = nil
-                write(Data([Frame.received] + Frame.number(incoming.token)), on: link, purpose: .acknowledgement)
-            default: return
+                try dispatch(packet, on: link)
+            default: throw TransferError.invalid
             }
             link.incomingAt = Date()
         } catch {
-            link.incoming = nil
-            receiveError = error.localizedDescription
+            disconnect(link, error: error)
+            central?.cancelPeripheralConnection(peripheral)
         }
     }
 }

@@ -1,48 +1,44 @@
-import CryptoKit
 import Foundation
 import UniformTypeIdentifiers
 
 struct Transfer: Identifiable {
     enum Kind: UInt8 { case text = 1, image, file }
-
-    static let limit = 3_000_000
-    static let maximumEnvelope = limit + 3 + 255 + 32
-
+    static let limit = 500_000
+    static let textLimit = 3_000_000
+    static let fileLimit: Int64 = 5_000_000_000
     let id = UUID()
     let kind: Kind
     let name: String
     let data: Data
-
+    let file: TemporaryFile?
+    var size: Int64 { file?.size ?? Int64(data.count) }
     var text: String { String(decoding: data, as: UTF8.self) }
 
-    init(kind: Kind, name: String = "", data: Data) throws {
-        guard data.count <= Self.limit else { throw TransferError.tooLarge }
-        guard name.utf8.count <= 255, kind != .text || String(data: data, encoding: .utf8) != nil
+    init(kind: Kind, name: String = "", data: Data, file: TemporaryFile? = nil) throws {
+        guard data.count <= (kind == .text ? Self.textLimit : Self.limit), (file?.size ?? 0) <= Self.fileLimit
+        else { throw TransferError.tooLarge }
+        guard name.utf8.count <= 255, kind != .text || (file == nil && String(data: data, encoding: .utf8) != nil)
         else { throw TransferError.invalid }
         self.kind = kind
         self.name = name
         self.data = data
+        self.file = file
     }
 
-    func envelope() -> Data {
-        let filename = Data(name.utf8)
-        var bytes = Data([kind.rawValue, UInt8(filename.count), 0])
-        bytes.append(filename)
-        bytes.append(data)
-        bytes.append(contentsOf: SHA256.hash(data: bytes))
-        return bytes
-    }
-
-    init(envelope: Data) throws {
-        guard (35...Self.maximumEnvelope).contains(envelope.count),
-              let kind = Kind(rawValue: envelope[0]) else { throw TransferError.invalid }
-        let nameEnd = 3 + Int(envelope[1]) + Int(envelope[2]) * 256
-        let body = envelope.dropLast(32)
-        guard nameEnd <= body.count, nameEnd <= 258,
-              envelope.suffix(32).elementsEqual(SHA256.hash(data: body)),
-              let name = String(data: body[3..<nameEnd], encoding: .utf8)
-        else { throw TransferError.invalid }
-        try self.init(kind: kind, name: name, data: Data(body[nameEnd...]))
+    static func importFile(_ url: URL, kind: Kind, name: String) throws -> Transfer {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard let length = attributes[.size] as? NSNumber else { throw TransferError.invalid }
+        let size = length.int64Value
+        guard size <= fileLimit else { throw TransferError.tooLarge }
+        if size <= Int64(limit) {
+            let source = try FileHandle(forReadingFrom: url)
+            defer { try? source.close() }
+            let data = try source.read(upToCount: limit + 1) ?? Data()
+            return try Transfer(kind: kind, name: name, data: data)
+        }
+        let file = TemporaryFile(size: size)
+        try FileManager.default.copyItem(at: url, to: file.url)
+        return try Transfer(kind: kind, name: name, data: Data(), file: file)
     }
 }
 
@@ -54,13 +50,8 @@ extension Transfer {
 
         guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
               values.isRegularFile == true else { return nil }
-        if let size = values.fileSize, size > Transfer.limit { throw TransferError.tooLarge }
-
-        guard let file = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? file.close() }
-        let bytes = try file.read(upToCount: Transfer.limit + 1) ?? Data()
         let name = filename(suggestedName ?? url.lastPathComponent, fallbackURL: url, type: type)
-        return try Transfer(kind: .file, name: name, data: bytes)
+        return try Transfer.importFile(url, kind: .file, name: name)
     }
 
     private static func filename(_ value: String, fallbackURL: URL, type: UTType?) -> String {
@@ -82,14 +73,15 @@ extension Transfer {
 }
 
 enum TransferError: LocalizedError {
-    case tooLarge, invalid, disconnected, timedOut
+    case tooLarge, invalid, disconnected, timedOut, message(String)
 
     var errorDescription: String? {
         switch self {
-        case .tooLarge: "The payload exceeds the 3 MB limit."
-        case .invalid: "Pipopu could not read the transfer."
-        case .disconnected: "The Bluetooth connection closed or the PC refused the transfer."
-        case .timedOut: "The PC stopped responding. Try again with both devices nearby."
+        case .tooLarge: "Files must be 5 GB or smaller. Text is limited to 3 MB."
+        case .invalid: "Pipopu could not verify the transfer."
+        case .disconnected: "The Bluetooth connection closed."
+        case .timedOut: "The other device stopped responding."
+        case .message(let text): text
         }
     }
 }
@@ -98,9 +90,7 @@ enum Frame {
     static let begin: UInt8 = 1
     static let chunk: UInt8 = 2
     static let end: UInt8 = 3
-    static let received: UInt8 = 4
-    static let available: UInt8 = 5
-    static let abort: UInt8 = 6
+    static let maximumPacket = 700_000
 
     static func number(_ value: UInt32) -> [UInt8] {
         (0..<4).map { UInt8(truncatingIfNeeded: value >> ($0 * 8)) }
@@ -111,7 +101,7 @@ enum Frame {
     }
 }
 
-struct IncomingTransfer {
+struct IncomingPacket {
     let token: UInt32
     let length: Int
     private var bytes = Data()
@@ -120,7 +110,7 @@ struct IncomingTransfer {
         guard begin.count == 9 else { throw TransferError.invalid }
         token = Frame.readNumber(begin, at: 1)
         length = Int(Frame.readNumber(begin, at: 5))
-        guard (35...Transfer.maximumEnvelope).contains(length) else { throw TransferError.invalid }
+        guard (1...Frame.maximumPacket).contains(length) else { throw TransferError.invalid }
     }
 
     mutating func append(_ frame: Data) throws {
@@ -128,9 +118,9 @@ struct IncomingTransfer {
         bytes.append(frame.dropFirst())
     }
 
-    func finish(_ frame: Data) throws -> Transfer {
+    func finish(_ frame: Data) throws -> Data {
         guard frame.count == 5, Frame.readNumber(frame, at: 1) == token, bytes.count == length
         else { throw TransferError.invalid }
-        return try Transfer(envelope: bytes)
+        return bytes
     }
 }

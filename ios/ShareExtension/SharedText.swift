@@ -62,7 +62,7 @@ enum SharedText {
                     case let url as URL where url.isFileURL:
                         guard let file = try? FileHandle(forReadingFrom: url) else { return nil }
                         defer { try? file.close() }
-                        guard let data = try? file.read(upToCount: Transfer.limit + 1) else { return nil }
+                        guard let data = try? file.read(upToCount: Transfer.textLimit + 1) else { return nil }
                         return try decode(data, as: type)
                     default:
                         return nil
@@ -73,7 +73,7 @@ enum SharedText {
     }
 
     private static func decode(_ data: Data, as type: UTType) throws -> String? {
-        guard data.count <= Transfer.limit else { throw TransferError.tooLarge }
+        guard data.count <= Transfer.textLimit else { throw TransferError.tooLarge }
         if let format = documentType(for: type) {
             return try? NSAttributedString(data: data, options: [.documentType: format], documentAttributes: nil).string
         }

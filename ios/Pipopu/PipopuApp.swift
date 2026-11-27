@@ -15,6 +15,7 @@ private struct ReceiverView: View {
     @State private var listening = true
     @State private var exporting = false
     @State private var status = ""
+    @State private var fileExport: ExportFile?
     @State private var draft = ""
     @State private var attachment: Transfer?
     @State private var importing = false
@@ -34,6 +35,17 @@ private struct ReceiverView: View {
                     .listRowInsets(EdgeInsets())
                 composer
                 recipients
+                Section("Trusted devices") {
+                    if bluetooth.trustedDevices.isEmpty {
+                        Text("No trusted devices yet.").foregroundStyle(.secondary)
+                    }
+                    ForEach(bluetooth.trustedDevices) { peer in
+                        LabeledContent(peer.name) {
+                            Button("Forget", role: .destructive) { bluetooth.forget(peer) }
+                                .buttonStyle(.borderless)
+                        }
+                    }
+                }
                 if let transfer = bluetooth.received {
                     Section("Received") {
                         if transfer.kind == .text {
@@ -43,7 +55,7 @@ private struct ReceiverView: View {
                                 status = "Copied text"
                             }
                         } else {
-                            if transfer.kind == .image, let image = UIImage(data: transfer.data) {
+                            if transfer.kind == .image, let image = imagePreview(transfer) {
                                 Image(uiImage: image).resizable().scaledToFit().frame(maxHeight: 240)
                                 Button("Copy image", systemImage: "doc.on.doc") {
                                     UIPasteboard.general.image = image
@@ -51,7 +63,12 @@ private struct ReceiverView: View {
                                 }
                             }
                             Button("Save " + (transfer.name.isEmpty ? "item" : transfer.name), systemImage: "square.and.arrow.down") {
-                                exporting = true
+                                if let file = transfer.file {
+                                    do { fileExport = try ExportFile(file, name: exportName) }
+                                    catch { status = error.localizedDescription }
+                                } else {
+                                    exporting = true
+                                }
                             }
                         }
                         Button("Clear", role: .destructive) {
@@ -94,6 +111,16 @@ private struct ReceiverView: View {
             updateListening()
         }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.item]) { chooseFile($0) }
+        .alert("Trust this PC?", isPresented: Binding(get: { bluetooth.pairing != nil }, set: { _ in }),
+               presenting: bluetooth.pairing) { _ in
+            Button("Trust device") { bluetooth.answerPairing(true) }
+            Button("Decline", role: .cancel) { bluetooth.answerPairing(false) }
+        } message: { request in
+            Text("Only trust \(request.name) if it shows code \(request.code).")
+        }
+        .sheet(item: $fileExport) { file in
+            LargeFileExporter(file: file)
+        }
         .fileExporter(
             isPresented: $exporting,
             document: bluetooth.received.map { ReceivedDocument(data: $0.data) },
@@ -130,7 +157,7 @@ private struct ReceiverView: View {
                     Label {
                         VStack(alignment: .leading, spacing: 3) {
                             Text(attachment.name).lineLimit(1)
-                            Text(ByteCountFormatter.string(fromByteCount: Int64(attachment.data.count), countStyle: .file))
+                            Text(ByteCountFormatter.string(fromByteCount: attachment.size, countStyle: .file))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -202,7 +229,7 @@ private struct ReceiverView: View {
                     }
                     .contentShape(Rectangle())
                 }
-                .disabled((draft.isEmpty && attachment == nil) || bluetooth.progress != nil)
+                .disabled(!peer.connected || (draft.isEmpty && attachment == nil) || bluetooth.progress != nil)
                 .accessibilityHint("Sends the selected text or file")
             }
             if !sendStatus.isEmpty {
@@ -217,7 +244,7 @@ private struct ReceiverView: View {
             guard let file = try Transfer.loadFile(at: url) else { throw TransferError.invalid }
             let type = UTType(filenameExtension: url.pathExtension)
             if type == .png || type == .jpeg {
-                attachment = try Transfer(kind: .image, name: file.name, data: file.data)
+                attachment = try Transfer(kind: .image, name: file.name, data: file.data, file: file.file)
             } else {
                 attachment = file
             }
@@ -255,6 +282,14 @@ private struct ReceiverView: View {
         UTType(filenameExtension: (exportName as NSString).pathExtension) ?? .data
     }
 
+    private func imagePreview(_ transfer: Transfer) -> UIImage? {
+        if let file = transfer.file {
+            guard file.size <= 8_000_000 else { return nil }
+            return UIImage(contentsOfFile: file.url.path)
+        }
+        return UIImage(data: transfer.data)
+    }
+
     private var displayName: String {
         let label = receiverName.trimmingCharacters(in: .whitespacesAndNewlines)
         return label.isEmpty ? UIDevice.current.model : label
@@ -269,6 +304,35 @@ private struct ReceiverView: View {
             bluetooth.stop()
         }
     }
+}
+
+private final class ExportFile: Identifiable {
+    let id = UUID()
+    let url: URL
+    private let folder: URL
+
+    init(_ file: TemporaryFile, name: String) throws {
+        folder = FileManager.default.temporaryDirectory.appendingPathComponent("pipopu-export-" + id.uuidString)
+        url = folder.appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        do { try FileManager.default.linkItem(at: file.url, to: url) }
+        catch {
+            try? FileManager.default.removeItem(at: folder)
+            throw error
+        }
+    }
+
+    deinit { try? FileManager.default.removeItem(at: folder) }
+}
+
+private struct LargeFileExporter: UIViewControllerRepresentable {
+    let file: ExportFile
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        UIDocumentPickerViewController(forExporting: [file.url], asCopy: true)
+    }
+
+    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
 }
 
 private struct ReceivedDocument: FileDocument {

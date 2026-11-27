@@ -38,6 +38,12 @@ internal partial class SendProgressView : UserControl, IProgress<int>
         Status.Text = percentage == 100 ? "Waiting for delivery confirmation…" : $"{percentage}% sent";
     }
 
+    internal void PairingCode(string? code)
+    {
+        if (Visibility == Visibility.Visible)
+            Status.Text = code is null ? "Connected…" : $"Check code {code} on the Apple device";
+    }
+
     internal void Complete()
     {
         HeadingText.Text = "Delivered";

@@ -2,6 +2,8 @@ using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
+using System.Threading.Channels;
 using Microsoft.Win32;
 using Windows.Devices.Bluetooth;
 using Windows.Devices.Bluetooth.GenericAttributeProfile;
@@ -11,10 +13,10 @@ namespace Pipopu;
 
 internal sealed class BluetoothServer : IDisposable
 {
-    private static readonly Guid ServiceId = new("EA259A30-8B6E-44DA-BEEC-E10D5680D630");
-    private static readonly Guid UploadId = new("EA259A31-8B6E-44DA-BEEC-E10D5680D630");
-    private static readonly Guid DownloadId = new("EA259A32-8B6E-44DA-BEEC-E10D5680D630");
-    private static readonly Guid NameId = new("EA259A33-8B6E-44DA-BEEC-E10D5680D630");
+    private static readonly Guid ServiceId = new("EA259A40-8B6E-44DA-BEEC-E10D5680D630");
+    private static readonly Guid UploadId = new("EA259A41-8B6E-44DA-BEEC-E10D5680D630");
+    private static readonly Guid DownloadId = new("EA259A42-8B6E-44DA-BEEC-E10D5680D630");
+    private static readonly Guid NameId = new("EA259A43-8B6E-44DA-BEEC-E10D5680D630");
     private const string DeviceNameKey = @"Software\Pipopu";
     private const string DeviceNameValue = "DeviceName";
     private const int MaxDeviceNameBytes = 64;
@@ -24,12 +26,45 @@ internal sealed class BluetoothServer : IDisposable
         public override string ToString() => Name;
     }
 
-    private sealed record PendingSend(uint Token, TaskCompletionSource Completion);
+    private sealed class Link(GattSubscribedClient client, SecureSession session)
+    {
+        internal GattSubscribedClient Client { get; } = client;
+        internal SecureSession Session { get; } = session;
+        internal SemaphoreSlim Writing { get; } = new(1);
+        internal string Name = "";
+        internal bool Receives;
+        internal Transaction? Active;
+    }
 
+    private sealed class Transaction(string id, CancellationToken cancellation = default) : IDisposable
+    {
+        internal string Id { get; } = id;
+        internal CancellationTokenSource Lifetime { get; } = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        internal Channel<Wire> Mail { get; } = Channel.CreateBounded<Wire>(8);
+
+        internal async Task<Wire> NextAsync(TimeSpan timeout)
+        {
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(Lifetime.Token);
+            deadline.CancelAfter(timeout);
+            var message = await Mail.Reader.ReadAsync(deadline.Token);
+            if (message.Type == "fail")
+                throw new IOException(message.Error ?? "The other device refused the transfer.");
+            return message;
+        }
+
+        public void Dispose() => Lifetime.Dispose();
+    }
+
+    private static readonly TimeSpan PairingTimeout = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan TransferTimeout = TimeSpan.FromHours(2);
     private readonly object gate = new();
-    private readonly Dictionary<string, IncomingTransfer> incoming = new();
-    private readonly Dictionary<string, string> names = new();
-    private readonly Dictionary<string, PendingSend> outgoing = new();
+    private readonly Dictionary<string, IncomingPacket> incoming = new();
+    private readonly Dictionary<string, Link> links = new();
+    internal TrustStore Trust { get; } = new();
+    internal OneDrive Cloud { get; } = new();
+    internal Func<string, string, CancellationToken, Task<bool>>? ConfirmTrust { get; set; }
+    internal event Action<string?>? PairingCodeChanged;
+
     private GattServiceProvider? provider;
     private GattLocalCharacteristic? upload;
     private GattLocalCharacteristic? download;
@@ -145,162 +180,418 @@ internal sealed class BluetoothServer : IDisposable
 
     internal Peer[] GetPeers()
     {
-        if (download is null)
-            return [];
-        var subscribers = download.SubscribedClients;
         lock (gate)
-        {
-            return subscribers.Select(client => client.Session.DeviceId.Id).Distinct()
-                .Where(names.ContainsKey)
-                .Select(id => new Peer(id, names[id]))
-                .OrderBy(peer => peer.Name)
-                .ToArray();
-        }
+            return links.Where(entry => entry.Value.Receives)
+                .Select(entry => new Peer(entry.Key, entry.Value.Name)).OrderBy(peer => peer.Name).ToArray();
+    }
+
+    internal void Forget(string identity)
+    {
+        Trust.Forget(identity);
+        lock (gate)
+            foreach (var link in links.Values.Where(link => link.Session.Identity == identity))
+                link.Active?.Lifetime.Cancel();
     }
 
     internal async Task SendAsync(Peer peer, Transfer transfer, IProgress<int> progress, CancellationToken cancellation)
     {
-        cancellation.ThrowIfCancellationRequested();
-        var characteristic = download ?? throw new InvalidOperationException("Bluetooth is still starting.");
-        var client = characteristic.SubscribedClients.FirstOrDefault(item => item.Session.DeviceId.Id == peer.Id)
-            ?? throw new IOException("The Apple device disconnected. Open Pipopu and try again.");
-
-        byte[] data = transfer.Encode();
-        uint token = BinaryPrimitives.ReadUInt32LittleEndian(RandomNumberGenerator.GetBytes(4));
-        var pending = new PendingSend(token, new(TaskCreationOptions.RunContinuationsAsynchronously));
+        using var transaction = new Transaction(Guid.NewGuid().ToString("N"), cancellation);
+        Link link;
         lock (gate)
         {
-            if (!names.ContainsKey(peer.Id) || !outgoing.TryAdd(peer.Id, pending))
-                throw new IOException("The Apple device is unavailable or busy.");
+            if (!links.TryGetValue(peer.Id, out link!) || !link.Receives || link.Active is not null)
+                throw new IOException("The selected device is disconnected or busy.");
+            link.Active = transaction;
         }
 
+        transaction.Lifetime.CancelAfter(TransferTimeout);
+        var token = transaction.Lifetime.Token;
+        string id = transaction.Id;
+        bool pair = !Trust.Contains(link.Session.Identity);
         try
         {
-            try
+            var offer = new Wire("offer", id, transfer.Name, (int)transfer.Kind, transfer.Size, pair);
+            Transfer.Validate(offer);
+            await SendPacketAsync(link, offer, token);
+            var review = await transaction.NextAsync(PairingTimeout);
+            Require(review, "review");
+            if (pair || review.Pair)
             {
-                await Indicate(Frame.Control(Frame.Begin, token, data.Length), cancellation);
-                int offset = 0;
-                while (offset < data.Length)
-                {
-                    int capacity = client.MaxNotificationSize - 1;
-                    if (capacity <= 0)
-                        throw new IOException("The Bluetooth connection closed.");
-                    int count = Math.Min(capacity, data.Length - offset);
-                    byte[] frame = new byte[count + 1];
-                    frame[0] = Frame.Chunk;
-                    data.AsSpan(offset, count).CopyTo(frame.AsSpan(1));
-                    await Indicate(frame, cancellation);
-                    offset += count;
-                    progress.Report(offset * 100 / data.Length);
-                }
-                cancellation.ThrowIfCancellationRequested();
+                PairingCodeChanged?.Invoke(link.Session.Code);
+                await EnsureTrustConfirmedAsync(link, token);
             }
-            catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
-            {
-                // A peer may have already received some chunks. Ask it to discard them.
-                try { await Indicate(Frame.Control(Frame.Abort, token), CancellationToken.None, timeoutSeconds: 1); }
-                catch (Exception error) { Debug.WriteLine(error); }
-                throw;
-            }
+            Require(await transaction.NextAsync(PairingTimeout), "accept");
+            PairingCodeChanged?.Invoke(null);
+            await SendPacketAsync(link, new Wire("verified", id), token);
+            if (pair || review.Pair)
+                Trust.Remember(link.Session.Identity, link.Name);
 
-            await Indicate(Frame.Control(Frame.End, token), CancellationToken.None);
-            await pending.Completion.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            if (transfer.Size <= Transfer.Limit)
+            {
+                await using var input = transfer.OpenRead();
+                var bytes = new byte[(int)transfer.Size];
+                await input.ReadExactlyAsync(bytes, token);
+                if (input.ReadByte() != -1)
+                    throw new IOException("The file changed while Pipopu was reading it.");
+                await SendPacketAsync(link, new Wire("data", id, Data: bytes), token, progress);
+                Require(await transaction.NextAsync(TimeSpan.FromSeconds(30)), "complete");
+            }
+            else
+            {
+                await using var input = transfer.OpenRead();
+                using var encrypted = await FileCipher.TransformAsync(input, transfer.Size, link.Session.FileKey(id), true, token);
+                if (!await TryLanAsync(link, transaction, encrypted, upload: false, progress))
+                {
+                    Uri? session = null;
+                    try
+                    {
+                        session = await Cloud.CreateUploadAsync(id, token);
+                        await Cloud.UploadAsync(session, encrypted, token, progress);
+                        var url = await Cloud.DownloadUrlAsync(id, token);
+                        await SendPacketAsync(link, new Wire("route", id, Urls: [url.AbsoluteUri], Route: "cloud"), token);
+                        Require(await transaction.NextAsync(TransferTimeout), "complete");
+                    }
+                    finally { if (session is not null) await Cloud.CleanupAsync(id, session); }
+                }
+            }
+        }
+        catch (Exception error)
+        {
+            await ReplyBestEffortAsync(link, new Wire(cancellation.IsCancellationRequested ? "cancel" : "fail",
+                id, Error: error.Message));
+            throw;
         }
         finally
         {
-            lock (gate)
-                outgoing.Remove(peer.Id);
+            PairingCodeChanged?.Invoke(null);
+            Release(link, transaction);
         }
+    }
 
-        async Task Indicate(byte[] frame, CancellationToken cancellationToken, int timeoutSeconds = 15)
+    private async Task ReceiveAsync(Link link, Transaction transaction, Wire offer)
+    {
+        using (transaction)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (frame.Length > client.MaxNotificationSize || pending.Completion.Task.IsCanceled)
+            transaction.Lifetime.CancelAfter(TransferTimeout);
+            var token = transaction.Lifetime.Token;
+            string id = transaction.Id;
+            TransferFile? received = null;
+            try
+            {
+                Transfer.Validate(offer);
+                bool pair = !Trust.Contains(link.Session.Identity) || offer.Pair;
+                await SendPacketAsync(link, new Wire("review", id, Pair: pair), token);
+                if (pair)
+                    await EnsureTrustConfirmedAsync(link, token);
+                await SendPacketAsync(link, new Wire("accept", id), token);
+                Require(await transaction.NextAsync(PairingTimeout), "verified");
+                token.ThrowIfCancellationRequested();
+                if (pair)
+                    Trust.Remember(link.Session.Identity, link.Name);
+
+                var kind = (TransferKind)offer.Kind;
+                Transfer transfer;
+                if (offer.Size <= Transfer.Limit)
+                {
+                    var message = await transaction.NextAsync(TimeSpan.FromMinutes(5));
+                    Require(message, "data");
+                    if (message.Data is not { } bytes || bytes.LongLength != offer.Size)
+                        throw new InvalidDataException("The payload size did not match the offer.");
+                    transfer = new Transfer(kind, offer.Name!, bytes);
+                    if (kind == TransferKind.Text)
+                        _ = transfer.Text;
+                }
+                else
+                {
+                    long encryptedSize = FileCipher.EncryptedSize(offer.Size);
+                    using var lanFile = new TransferFile(TransferFile.TemporaryPath(), encryptedSize);
+                    if (await TryLanAsync(link, transaction, lanFile, upload: true))
+                    {
+                        await using var input = File.OpenRead(lanFile.Path);
+                        received = await FileCipher.TransformAsync(input, offer.Size, link.Session.FileKey(id), false, token);
+                    }
+                    else
+                    {
+                        string cloudId = Guid.NewGuid().ToString("N");
+                        Uri? session = null;
+                        try
+                        {
+                            session = await Cloud.CreateUploadAsync(cloudId, token);
+                            await SendPacketAsync(link, new Wire("route", id, Urls: [session.AbsoluteUri], Route: "cloud"), token);
+                            Require(await transaction.NextAsync(TransferTimeout), "uploaded");
+                            using var cloudFile = await Cloud.DownloadAsync(cloudId, encryptedSize, token);
+                            await using var input = File.OpenRead(cloudFile.Path);
+                            received = await FileCipher.TransformAsync(input, offer.Size, link.Session.FileKey(id), false, token);
+                        }
+                        finally { if (session is not null) await Cloud.CleanupAsync(cloudId, session); }
+                    }
+                    if (kind == TransferKind.Text)
+                    {
+                        transfer = new Transfer(kind, offer.Name!, File.ReadAllBytes(received.Path));
+                        _ = transfer.Text;
+                        received.Dispose();
+                        received = null;
+                    }
+                    else
+                    {
+                        transfer = new Transfer(kind, offer.Name!, [], received);
+                    }
+                }
+
+                token.ThrowIfCancellationRequested();
+                TransferReceived?.Invoke(transfer);
+                received = null;
+                await SendPacketAsync(link, new Wire("complete", id), token);
+            }
+            catch (Exception error)
+            {
+                await ReplyBestEffortAsync(link, new Wire("fail", id, Error: error.Message));
+            }
+            finally
+            {
+                received?.Dispose();
+                Release(link, transaction);
+            }
+        }
+    }
+
+    private async Task<bool> TryLanAsync(Link link, Transaction transaction, TransferFile file, bool upload,
+        IProgress<int>? progress = null)
+    {
+        var token = transaction.Lifetime.Token;
+        LanTransfer server;
+        try { server = await LanTransfer.OpenAsync(file, upload, token, progress); }
+        catch (Exception error) when (!token.IsCancellationRequested && error is IOException or System.Net.Sockets.SocketException)
+        {
+            return false;
+        }
+        await using (server)
+        {
+            await SendPacketAsync(link, new Wire("route", transaction.Id, Urls: server.Urls, Route: "lan"), token);
+            var reply = await transaction.NextAsync(TransferTimeout);
+            if (reply.Type == "fallback")
+                return false;
+            Require(reply, upload ? "uploaded" : "complete");
+            await server.Completion.WaitAsync(TimeSpan.FromSeconds(10), token);
+            return true;
+        }
+    }
+
+    private async Task EnsureTrustConfirmedAsync(Link link, CancellationToken cancellation)
+    {
+        using var prompt = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        prompt.CancelAfter(PairingTimeout);
+        if (ConfirmTrust is null || !await ConfirmTrust(link.Name, link.Session.Code, prompt.Token))
+            throw new IOException("The pairing request was declined.");
+        cancellation.ThrowIfCancellationRequested();
+    }
+
+    private static void Require(Wire message, string type)
+    {
+        if (message.Type != type)
+            throw new InvalidDataException($"Expected {type} from the other device.");
+    }
+
+    private void Release(Link link, Transaction transaction)
+    {
+        lock (gate)
+            if (link.Active == transaction)
+                link.Active = null;
+    }
+
+    private async Task ReplyBestEffortAsync(Link link, Wire message)
+    {
+        try
+        {
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            await SendPacketAsync(link, message, deadline.Token);
+        }
+        catch (Exception error) { Debug.WriteLine(error); }
+    }
+
+    private async Task SendPacketAsync(Link link, Wire packet, CancellationToken cancellation, IProgress<int>? progress = null)
+    {
+        await link.Writing.WaitAsync(cancellation);
+        try { await IndicateAsync(link.Client, link.Session.Seal(packet), cancellation, progress); }
+        finally { link.Writing.Release(); }
+    }
+
+    private async Task IndicateAsync(GattSubscribedClient client, byte[] packet, CancellationToken cancellation,
+        IProgress<int>? progress = null)
+    {
+        var characteristic = download ?? throw new IOException("Bluetooth is unavailable.");
+        uint token = BinaryPrimitives.ReadUInt32LittleEndian(RandomNumberGenerator.GetBytes(4));
+        await FrameAsync(Frame.Control(Frame.Begin, token, packet.Length));
+        int previous = -1;
+        for (int offset = 0; offset < packet.Length;)
+        {
+            int count = Math.Min(client.MaxNotificationSize - 1, packet.Length - offset);
+            if (count <= 0)
                 throw new IOException("The Bluetooth connection closed.");
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
-            var result = await characteristic.NotifyValueAsync(MakeBuffer(frame), client).AsTask(timeout.Token);
-            cancellationToken.ThrowIfCancellationRequested();
+            var frame = new byte[count + 1];
+            frame[0] = Frame.Chunk;
+            packet.AsSpan(offset, count).CopyTo(frame.AsSpan(1));
+            await FrameAsync(frame);
+            offset += count;
+            int percent = 95 * offset / packet.Length;
+            if (percent != previous)
+            {
+                previous = percent;
+                progress?.Report(percent);
+            }
+        }
+        await FrameAsync(Frame.Control(Frame.End, token));
+
+        async Task FrameAsync(byte[] frame)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+            deadline.CancelAfter(TimeSpan.FromSeconds(15));
+            var result = await characteristic.NotifyValueAsync(MakeBuffer(frame), client).AsTask(deadline.Token);
             if (result.Status != GattCommunicationStatus.Success)
-                throw new IOException($"Bluetooth delivery failed ({result.Status}).");
+                throw new IOException("The Bluetooth connection closed.");
         }
     }
 
     private async void OnWrite(GattLocalCharacteristic sender, GattWriteRequestedEventArgs args)
     {
-        using var deferral = args.GetDeferral();
         GattWriteRequest? request = null;
-        Transfer? transfer = null;
-        bool refreshPeers = false;
-        try
+        Task? dispatch = null;
+        string id = "";
+        using (args.GetDeferral())
         {
-            request = await args.GetRequestAsync();
-            if (request is null || request.Option != GattWriteOption.WriteWithResponse)
+            try
+            {
+                byte[]? packet = null;
+                request = await args.GetRequestAsync();
+                if (request is null || request.Option != GattWriteOption.WriteWithResponse)
+                    return;
+                id = args.Session.DeviceId.Id;
+                if (request.Offset != 0 || request.Value.Length is < 1 or > 512)
+                    throw new InvalidDataException("Invalid Bluetooth frame.");
+                using var reader = DataReader.FromBuffer(request.Value);
+                byte[] frame = new byte[request.Value.Length];
+                reader.ReadBytes(frame);
+                lock (gate)
+                {
+                    foreach (var stale in incoming.Where(entry => DateTime.UtcNow - entry.Value.LastActivity > TimeSpan.FromSeconds(30))
+                        .Select(entry => entry.Key).ToArray())
+                        incoming.Remove(stale);
+                    switch (frame[0])
+                    {
+                        case Frame.Begin when incoming.Count < 16 || incoming.ContainsKey(id):
+                            incoming[id] = new IncomingPacket(frame);
+                            break;
+                        case Frame.Chunk when incoming.TryGetValue(id, out var partial):
+                            partial.Append(frame);
+                            break;
+                        case Frame.End when incoming.Remove(id, out var complete):
+                            packet = complete.Finish(frame);
+                            break;
+                        default:
+                            throw new InvalidDataException("Unexpected Bluetooth frame.");
+                    }
+                }
+                if (packet is not null)
+                    dispatch = DispatchAsync(id, packet);
+                request.Respond();
+            }
+            catch (Exception error)
+            {
+                Debug.WriteLine(error);
+                try { request?.RespondWithProtocolError(0x80); }
+                catch (System.Runtime.InteropServices.COMException) { }
                 return;
+            }
+        }
 
-            string id = args.Session.DeviceId.Id;
-            byte[] frame = ReadBuffer(request.Value);
-            if (request.Offset != 0 || frame.Length == 0)
-                throw new InvalidDataException("Invalid write.");
+        if (dispatch is null)
+            return;
+        try { await dispatch; }
+        catch (Exception error) { Debug.WriteLine(error); }
+    }
 
+    private async Task DispatchAsync(string id, byte[] packet)
+    {
+        if (packet[0] == 1 && packet.Length == 98)
+        {
+            var client = download?.SubscribedClients.FirstOrDefault(client => client.Session.DeviceId.Id == id);
+            if (client is null)
+                return;
+            byte[] welcome = [2, .. Trust.PublicKey, .. RandomNumberGenerator.GetBytes(32)];
+            var established = new Link(client, new SecureSession(Trust, packet, welcome));
             lock (gate)
             {
-                foreach (var key in incoming.Where(pair => DateTime.UtcNow - pair.Value.LastActivity > TimeSpan.FromSeconds(30))
-                             .Select(pair => pair.Key).ToArray())
-                    incoming.Remove(key);
-
-                switch (frame[0])
-                {
-                    case Frame.Begin when incoming.Count < 8 || incoming.ContainsKey(id):
-                        incoming[id] = new IncomingTransfer(frame);
-                        break;
-                    case Frame.Chunk when incoming.TryGetValue(id, out var partial):
-                        partial.Append(frame);
-                        break;
-                    case Frame.End when incoming.Remove(id, out var complete):
-                        transfer = complete.Finish(frame);
-                        break;
-                    case Frame.Available when frame.Length is > 1 and <= 65:
-                        if (download?.SubscribedClients.Any(client => client.Session.DeviceId.Id == id) != true)
-                            throw new InvalidDataException("Subscribe before registering a receiver.");
-                        names[id] = Encoding.UTF8.GetString(frame, 1, frame.Length - 1);
-                        refreshPeers = true;
-                        break;
-                    case Frame.Received when frame.Length == 5 && outgoing.TryGetValue(id, out var pending)
-                        && pending.Token == BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(1)):
-                        pending.Completion.TrySetResult();
-                        break;
-                    default:
-                        throw new InvalidDataException("Unexpected transfer frame.");
-                }
+                if (links.Count >= 16 || links.ContainsKey(id))
+                    return;
+                links[id] = established;
             }
-
-            request.Respond();
-        }
-        catch (Exception ex) when (ex is InvalidDataException or ArgumentException or System.Runtime.InteropServices.COMException)
-        {
-            try { request?.RespondWithProtocolError(0x80); }
-            catch (System.Runtime.InteropServices.COMException) { }
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            try { await IndicateAsync(client, welcome, deadline.Token); }
+            catch
+            {
+                lock (gate) links.Remove(id);
+                throw;
+            }
             return;
         }
 
-        if (refreshPeers)
+        Link link;
+        Wire message;
+        Transaction? inbound = null;
+        bool busy = false;
+        lock (gate)
+        {
+            if (!links.TryGetValue(id, out link!))
+                return;
+            message = link.Session.Open(packet);
+            if (message.Type == "ready" && link.Active is null &&
+                message.Name is { } name && IsValidName(name))
+            {
+                link.Name = name;
+                link.Receives = message.Receive;
+            }
+            else if (message.Type == "offer" && message.Id is { } transferId && link.Name.Length > 0)
+            {
+                if (link.Active is null && links.Values.Count(peer => peer.Active is not null) < 4)
+                    link.Active = inbound = new Transaction(transferId);
+                else
+                    busy = true;
+            }
+            else if (link.Active is { } active && active.Id == message.Id)
+            {
+                if (message.Type == "cancel")
+                    active.Lifetime.Cancel();
+                else if (!active.Mail.Writer.TryWrite(message))
+                    active.Lifetime.Cancel();
+                return;
+            }
+            else
+                return;
+        }
+
+        if (message.Type == "ready")
+        {
+            await ReplyBestEffortAsync(link, new Wire("ready", Name: DeviceName));
             PeersChanged?.Invoke();
-        if (transfer is not null)
-            TransferReceived?.Invoke(transfer);
+        }
+        else if (inbound is not null)
+            await ReceiveAsync(link, inbound, message);
+        else if (busy)
+            await ReplyBestEffortAsync(link, new Wire("fail", message.Id, Error: "The PC is busy. Try again in a moment."));
     }
 
     private void OnSubscribersChanged(GattLocalCharacteristic sender, object args)
     {
-        var ids = sender.SubscribedClients.Select(client => client.Session.DeviceId.Id).ToHashSet();
+        var present = sender.SubscribedClients.Select(client => client.Session.DeviceId.Id).ToHashSet();
         lock (gate)
         {
-            foreach (string id in names.Keys.Where(id => !ids.Contains(id)).ToArray())
+            foreach (string id in links.Keys.Where(id => !present.Contains(id)).ToArray())
             {
-                names.Remove(id);
+                var link = links[id];
+                links.Remove(id);
                 incoming.Remove(id);
-                if (outgoing.TryGetValue(id, out var pending))
-                    pending.Completion.TrySetCanceled();
+                link.Active?.Lifetime.Cancel();
             }
         }
         PeersChanged?.Invoke();
@@ -330,19 +621,12 @@ internal sealed class BluetoothServer : IDisposable
         return writer.DetachBuffer();
     }
 
-    private static byte[] ReadBuffer(IBuffer buffer)
-    {
-        if (buffer.Length > 512)
-            throw new InvalidDataException("The BLE frame is too large.");
-        using var reader = DataReader.FromBuffer(buffer);
-        byte[] bytes = new byte[buffer.Length];
-        reader.ReadBytes(bytes);
-        return bytes;
-    }
-
     public void Dispose()
     {
         disposed = true;
+        lock (gate)
+            foreach (var link in links.Values)
+                link.Active?.Lifetime.Cancel();
         if (upload is not null)
             upload.WriteRequested -= OnWrite;
         if (download is not null)

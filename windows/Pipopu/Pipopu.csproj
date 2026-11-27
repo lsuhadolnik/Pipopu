@@ -11,6 +11,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <Resource Include="Pipopu.ico" />
     <Using Include="System.IO" />
     <Using Remove="System.Drawing" />

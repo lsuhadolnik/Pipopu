@@ -1,4 +1,3 @@
-import ImageIO
 import SwiftUI
 import UniformTypeIdentifiers
 import UIKit
@@ -29,7 +28,7 @@ final class ShareViewController: UIViewController {
         bluetooth.start()
     }
 
-    deinit { bluetooth.stop() }
+    deinit { Task { @MainActor [bluetooth] in bluetooth.stop() } }
 }
 
 private struct ShareView: View {
@@ -79,6 +78,10 @@ private struct ShareView: View {
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                         }
+                        if let code = bluetooth.pairingCode {
+                            Text("Check code \(code) on the PC, then approve the pairing there.")
+                                .font(.footnote)
+                        }
                     }
                 }
                 .padding(22)
@@ -99,9 +102,15 @@ private struct ShareView: View {
         .sensoryFeedback(trigger: finishedAttempt) { _, _ in
             bluetooth.sendCompleted ? .success : .error
         }
+        .alert("Trust this PC?", isPresented: Binding(get: { bluetooth.pairing != nil }, set: { _ in }),
+               presenting: bluetooth.pairing) { _ in
+            Button("Trust device") { bluetooth.answerPairing(true) }
+            Button("Decline", role: .cancel) { bluetooth.answerPairing(false) }
+        } message: { request in
+            Text("Only trust \(request.name) if it shows code \(request.code).")
+        }
         .task(id: bluetooth.sendCompleted) {
             guard bluetooth.sendCompleted else { return }
-            // Leave time for the success checkmark and haptic before the host dismisses the extension.
             try? await Task.sleep(for: .milliseconds(400))
             guard !Task.isCancelled else { return }
             close()
@@ -125,7 +134,7 @@ private struct ShareView: View {
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(2)
                 if item.kind != .text {
-                    Text(ByteCountFormatter.string(fromByteCount: Int64(item.data.count), countStyle: .file))
+                    Text(ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -199,7 +208,7 @@ private struct ShareView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(DeviceButtonStyle())
-        .disabled(transfer == nil || bluetooth.progress != nil || bluetooth.sendCompleted)
+        .disabled(transfer == nil || !peer.connected || bluetooth.progress != nil || bluetooth.sendCompleted)
         .opacity(!isSelected && (bluetooth.progress != nil || bluetooth.sendCompleted) ? 0.55 : 1)
         .accessibilityLabel("Send to " + peer.name)
         .accessibilityValue(progress?.formatted(.percent.precision(.fractionLength(0))) ?? (delivered ? "Sent" : ""))
@@ -234,30 +243,7 @@ private struct ShareView: View {
     }
 
     private static func loadImage(at url: URL, identifier: String) throws -> Transfer {
-        let file = try FileHandle(forReadingFrom: url)
-        defer { try? file.close() }
-        let data = try file.read(upToCount: Transfer.limit + 1) ?? Data()
-        let type = UTType(identifier)
-        if data.count <= Transfer.limit, type == .jpeg || type == .png,
-           let ext = type?.preferredFilenameExtension {
-            return try Transfer(kind: .image, name: "Shared image.\(ext)", data: data)
-        }
-
-        // Convert HEIC and large photos to a size and format Windows can copy.
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let preview = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-                kCGImageSourceCreateThumbnailFromImageAlways: true,
-                kCGImageSourceCreateThumbnailWithTransform: true,
-                kCGImageSourceThumbnailMaxPixelSize: 2048
-              ] as CFDictionary)
-        else { throw TransferError.invalid }
-
-        let image = UIImage(cgImage: preview)
-        for quality in [0.9, 0.75, 0.55] {
-            if let jpeg = image.jpegData(compressionQuality: quality), jpeg.count <= Transfer.limit {
-                return try Transfer(kind: .image, name: "Shared image.jpg", data: jpeg)
-            }
-        }
-        throw TransferError.tooLarge
+        let ext = UTType(identifier)?.preferredFilenameExtension ?? url.pathExtension
+        return try Transfer.importFile(url, kind: .image, name: ext.isEmpty ? "Shared image" : "Shared image.\(ext)")
     }
 }

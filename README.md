@@ -1,6 +1,6 @@
 # Pipopu
 
-Pipopu sends text, images, and files of up to 3 MB between an iPhone or iPad and a Windows PC over Bluetooth Low Energy.
+Pipopu sends text, images, and files between an iPhone or iPad and a Windows PC. Bluetooth Low Energy handles discovery, pairing, and payloads up to 500 KB. Larger payloads use local Wi-Fi or an optional OneDrive fallback.
 
 ## Run on Windows
 
@@ -39,32 +39,33 @@ Open Pipopu and grant Bluetooth access. To send from the app, type or paste text
 
 In Photos, Notes, or Files, share one item and choose **Send via Pipopu** in the Share Sheet’s actions. Tap a PC to send. The ring around that PC shows transfer progress, and the send screen closes once Windows confirms receipt. You can also choose **Pipopu** in the app row. Use **Edit Actions** in the Share Sheet to favorite the action and adjust its order. iOS controls which actions appear in the compact row.
 
-Shared web URLs are sent as text. Pipopu keeps JPEG and PNG originals that fit and converts other or larger photos to a smaller JPEG for Windows clipboard compatibility. Files up to 3 MB retain their contents and can be saved from the receipt popup on Windows.
+Shared web URLs are sent as text. Files and images retain their original bytes. Receivers can save files up to 5 GB, and text can be up to 3 MB. Some image formats may only be available to save on Windows. Allow Pipopu to access the local network on iOS to use Wi-Fi from the app and the Share Sheet.
 
 If Xcode reports that it could not mount the developer disk image, check for [Xcode hardware support updates](https://developer.apple.com/documentation/xcode/downloading-and-installing-additional-xcode-components) for the device's OS version.
 
-## BLE behavior
+## Pairing and large transfers
 
-Windows advertises the Pipopu service UUID. The Apple app and Share Sheet extension scan for that UUID. To receive from Windows, the foreground Apple app subscribes to its download characteristic and registers the label shown on the PC. The Windows adapter and driver must support connectable GATT advertising. Large transfers can take several minutes, depending on the adapter and connection.
+Install this version on both devices. When either side sends to a new device, compare the six-digit code and approve on both screens. Pipopu saves the peer's public key and authenticates paired devices on each connection. A decline ends the attempt and leaves the device eligible to ask again. Manage saved peers in **Trusted devices** in the iOS app and the Windows tray menu.
 
-This bootstrap has no peer authentication or app-level encryption. The service UUID identifies protocol-compatible devices. Nearby devices that implement the protocol can send to the Windows app while it is advertising.
+For large files, Pipopu on Windows starts a temporary HTTP endpoint on an active private IPv4 address. The Apple device probes it to see if the two devices can communicate. This works with Windows on Ethernet as well as Wi-Fi if the devices can reach each other. If Windows Firewall prompts, allow Pipopu on the private network. Pipopu encrypts file data before making it available over HTTP or OneDrive.
 
-### Wire format
+If the local endpoint is unreachable, configure **OneDrive fallback** in the Windows tray menu:
 
-Service and characteristic UUIDs share the suffix `-8B6E-44DA-BEEC-E10D5680D630`.
+1. In the Microsoft Entra admin center, register a public-client application that supports the accounts you want to use. To support both personal Microsoft and work or school accounts, select the corresponding multi-tenant and personal-account option.
+2. Enable **Allow public client flows** and add the delegated Microsoft Graph **Files.ReadWrite** permission.
+3. Enter the registration's **Application (client) ID** in Pipopu and use the code to sign in at Microsoft. Pipopu keeps the session in memory, so sign in again after restarting Windows Pipopu.
 
-| Prefix | Purpose |
-| --- | --- |
-| `EA259A30` | Advertised Pipopu GATT service |
-| `EA259A31` | Apple-to-Windows writes with response |
-| `EA259A32` | Windows-to-Apple indications |
-| `EA259A33` | Readable UTF-8 PC name |
+Windows uses a temporary encrypted OneDrive item and sends its preauthenticated download URL over the secured BLE connection. When sending from Apple, Windows creates a preauthenticated upload session and shares its URL over BLE. Apple uploads in order and reports completion, then Windows retrieves and verifies the file before acknowledging it. Windows removes its temporary OneDrive items after the transfer when it can reach OneDrive.
 
-A transfer consists of a start frame (opcode `01`, 32-bit token, 32-bit envelope length), one or more data frames (opcode `02` and envelope bytes), and an end frame (opcode `03` and the token). The envelope contains the type byte (1 text, 2 image, 3 file), a 16-bit UTF-8 filename length, up to 255 filename bytes, up to 3,000,000 payload bytes, and the 32-byte SHA-256 digest of all preceding envelope bytes. Integers are little-endian. Windows acknowledges successful receipt through the end-frame write response. Apple writes opcode `04` with the token after validating a download, and opcode `05` with its UTF-8 display label after subscribing. When the user cancels a download before its end frame, Windows sends opcode `06` with the token so Apple can discard the partial transfer.
+## Wire protocol
 
-### Hardware smoke test
+Version 2 uses service UUID `EA259A40-8B6E-44DA-BEEC-E10D5680D630`. Windows exposes Apple writes with response (prefix `EA259A41`), Windows indications (`EA259A42`), and a readable discovery label (`EA259A43`). Version 1 clients use a separate service and cannot receive unpaired data from version 2.
 
-1. Start the Windows tray app and confirm it reports that Bluetooth is available.
-2. Share text and then a photo from iOS. Verify that the correct PC appears and that each Windows popup copies the expected content. Share a file from Files, save it from the Windows popup, and compare it with the original.
-3. Open Pipopu on iOS. Send text, an image, and a file close to 3 MB from Windows. Copy the text and image, save the file to Files, and compare it with the original.
-4. Background the Apple app during a transfer. Reopen it and verify the Windows device list recovers and a fresh send succeeds.
+A packet travels as a start frame (opcode `01`, little-endian 32-bit token and length), data frames (opcode `02` followed by bytes), and an end frame (opcode `03` and token). The initial packets exchange P-256 public keys and random nonces. Both sides derive directional AES-GCM keys and a pairing code using HKDF-SHA256 over the agreement secret and the handshake transcript. Encrypted packets carry a monotonically increasing sequence number and protect transfer offers, approvals, route negotiation, and completion. Bulk payloads use a transfer-specific AES-GCM key with a separate nonce for each 256 KiB block.
+
+## Hardware smoke test
+
+1. Send small text and a file in both directions. Compare pairing codes, decline once, retry, then approve. Repeat the transfer without a prompt.
+2. Transfer a file above 500 KB in both directions while both devices can reach each other locally. Save both received files and compare their hashes.
+3. Sign into OneDrive, put the devices on networks that cannot reach each other, and repeat the large-file test. Keep Bluetooth in range to exchange transfer controls. Confirm the temporary OneDrive items are removed.
+4. Forget a device and confirm the next transfer asks for approval again. Cancel a send and start another.

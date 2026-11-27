@@ -59,6 +59,8 @@ internal partial class Composer : FlyoutWindow
         AutomationProperties.SetName(BluetoothIndicator, message);
     }
 
+    internal void SetPairingCode(string? code) => SendView.PairingCode(code);
+
     private void RefreshDeviceName()
     {
         NameLabel.Text = server.DeviceName;
@@ -202,12 +204,8 @@ internal partial class Composer : FlyoutWindow
     private void AttachFile(string path)
     {
         using var input = File.OpenRead(path);
-        if (input.Length > Transfer.Limit)
-            throw new InvalidDataException("The file exceeds the 3 MB limit.");
-        var bytes = new byte[(int)input.Length];
-        input.ReadExactly(bytes);
-        if (input.ReadByte() != -1)
-            throw new IOException("The file changed while Pipopu was reading it.");
+        if (input.Length > Transfer.FileLimit)
+            throw new InvalidDataException("The file exceeds the 5 GB limit.");
 
         string name = Path.GetFileName(path);
         var kind = Path.GetExtension(name).ToLowerInvariant() switch
@@ -215,7 +213,16 @@ internal partial class Composer : FlyoutWindow
             ".png" or ".jpg" or ".jpeg" or ".gif" or ".bmp" or ".tif" or ".tiff" or ".heic" or ".heif" or ".webp" => TransferKind.Image,
             _ => TransferKind.File
         };
-        SetAttachment(new(kind, name, bytes));
+        if (input.Length > Transfer.Limit)
+            SetAttachment(new(kind, name, [], new TransferFile(path, input.Length, owned: false)));
+        else
+        {
+            var bytes = new byte[(int)input.Length];
+            input.ReadExactly(bytes);
+            if (input.ReadByte() != -1)
+                throw new IOException("The file changed while Pipopu was reading it.");
+            SetAttachment(new(kind, name, bytes));
+        }
     }
 
     private void AttachImage(BitmapSource image)
@@ -229,18 +236,33 @@ internal partial class Composer : FlyoutWindow
 
     private void SetImageAttachment(MemoryStream bytes)
     {
-        if (bytes.Length > Transfer.Limit)
-            throw new InvalidDataException("The image exceeds the 3 MB limit.");
-        SetAttachment(new(TransferKind.Image, "Clipboard image.png", bytes.ToArray()));
+        if (bytes.Length > Transfer.FileLimit)
+            throw new InvalidDataException("The image exceeds the 5 GB limit.");
+        if (bytes.Length <= Transfer.Limit)
+        {
+            SetAttachment(new(TransferKind.Image, "Clipboard image.png", bytes.ToArray()));
+        }
+        else
+        {
+            var file = new TransferFile(TransferFile.TemporaryPath(), bytes.Length);
+            try
+            {
+                using (var output = File.Create(file.Path))
+                    bytes.WriteTo(output);
+                SetAttachment(new(TransferKind.Image, "Clipboard image.png", [], file));
+            }
+            catch { file.Dispose(); throw; }
+        }
     }
 
     private void SetAttachment(Transfer? value)
     {
+        attachment?.File?.Dispose();
         attachment = value;
         Message.IsEnabled = value is null;
         AttachmentLabel.Text = value is null
-            ? "Drop an image or file up to 3 MB"
-            : $"{value.Name} ({value.Data.Length:N0} bytes)";
+            ? "Drop an image or file up to 5 GB"
+            : $"{value.Name} ({value.Size:N0} bytes)";
         AttachmentLabel.ToolTip = value is null ? null : AttachmentLabel.Text;
         ClearAttachment.Visibility = value is null ? Visibility.Collapsed : Visibility.Visible;
         RefreshSend();
@@ -270,7 +292,11 @@ internal partial class Composer : FlyoutWindow
         try
         {
             var transfer = attachment ?? new Transfer(TransferKind.Text, "", Encoding.UTF8.GetBytes(Message.Text));
-            await server.SendAsync(peer, transfer, SendView, cancellation.Token);
+            await server.SendAsync(peer, transfer, new Progress<int>(value =>
+            {
+                if (sendCancellation == cancellation)
+                    SendView.Report(value);
+            }), cancellation.Token);
             if (!exiting)
             {
                 SendView.Complete();
