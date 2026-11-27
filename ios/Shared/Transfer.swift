@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import UniformTypeIdentifiers
 
 struct Transfer: Identifiable {
     enum Kind: UInt8 { case text = 1, image, file }
@@ -42,6 +43,41 @@ struct Transfer: Identifiable {
               let name = String(data: body[3..<nameEnd], encoding: .utf8)
         else { throw TransferError.invalid }
         try self.init(kind: kind, name: name, data: Data(body[nameEnd...]))
+    }
+}
+
+extension Transfer {
+    static func loadFile(at url: URL, suggestedName: String? = nil, type: UTType? = nil) throws -> Transfer? {
+        guard url.isFileURL else { return nil }
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+
+        guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+              values.isRegularFile == true else { return nil }
+        if let size = values.fileSize, size > Transfer.limit { throw TransferError.tooLarge }
+
+        guard let file = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? file.close() }
+        let bytes = try file.read(upToCount: Transfer.limit + 1) ?? Data()
+        let name = filename(suggestedName ?? url.lastPathComponent, fallbackURL: url, type: type)
+        return try Transfer(kind: .file, name: name, data: bytes)
+    }
+
+    private static func filename(_ value: String, fallbackURL: URL, type: UTType?) -> String {
+        let component = (value.replacingOccurrences(of: "\\", with: "/") as NSString).lastPathComponent
+        let cleanName = component.isEmpty || component == "." || component == ".." ? "Shared file" : component
+        let name = cleanName as NSString
+        var suffix = name.pathExtension
+        if suffix.isEmpty {
+            suffix = fallbackURL.pathExtension.isEmpty
+                ? (type?.preferredFilenameExtension ?? "")
+                : fallbackURL.pathExtension
+        }
+        let extensionPart = suffix.isEmpty || suffix.utf8.count > 32 ? "" : "." + suffix
+        var stem = name.deletingPathExtension
+        if stem.isEmpty { stem = "Shared file" }
+        while stem.utf8.count + extensionPart.utf8.count > 255 { stem.removeLast() }
+        return (stem.isEmpty ? "Shared file" : stem) + extensionPart
     }
 }
 

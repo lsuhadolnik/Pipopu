@@ -14,6 +14,13 @@ final class Bluetooth: NSObject, ObservableObject {
         var connected = false
     }
 
+    private enum WritePurpose { case send, registration, acknowledgement }
+
+    private struct PendingWrite {
+        let frame: Data
+        let purpose: WritePurpose
+    }
+
     private final class Link {
         let peripheral: CBPeripheral
         var peer: Peer
@@ -21,6 +28,11 @@ final class Bluetooth: NSObject, ObservableObject {
         var connectingSince: Date?
         var upload: CBCharacteristic?
         var download: CBCharacteristic?
+        var writing: WritePurpose?
+        var pendingWrites: [PendingWrite] = []
+        var nameCharacteristic: CBCharacteristic?
+        var nextNameRead = Date.distantPast
+        var hasServiceName = false
         var incoming: IncomingTransfer?
         var incomingAt = Date.distantPast
 
@@ -46,6 +58,7 @@ final class Bluetooth: NSObject, ObservableObject {
     @Published private(set) var progress: Double?
     @Published private(set) var result: String?
     @Published private(set) var received: Transfer?
+    @Published private(set) var receiveError: String?
     @Published private(set) var sendCompleted = false
 
     private var central: CBCentralManager?
@@ -76,9 +89,28 @@ final class Bluetooth: NSObject, ObservableObject {
 
     func clearReceived() { received = nil }
 
+    func updateReceivingName(_ name: String?) {
+        guard receivingName != name else { return }
+        let availabilityChanged = (receivingName == nil) != (name == nil)
+        receivingName = name
+        for link in links.values where link.peripheral.state == .connected {
+            guard let download = link.download else { continue }
+            if availabilityChanged {
+                link.peripheral.setNotifyValue(name != nil, for: download)
+            } else if let name, download.isNotifying {
+                announce(name, on: link)
+            }
+        }
+    }
+
     func send(_ transfer: Transfer, to id: UUID, onFinish: @escaping () -> Void) {
-        guard send == nil, let link = links[id] else { return }
+        guard send == nil else { return }
         sendCompleted = false
+        guard let link = links[id] else {
+            result = TransferError.disconnected.localizedDescription
+            onFinish()
+            return
+        }
         result = nil
         progress = 0
         send = Send(id: id, data: transfer.envelope(), onFinish: onFinish)
@@ -114,12 +146,44 @@ final class Bluetooth: NSObject, ObservableObject {
                 central?.cancelPeripheralConnection(link.peripheral)
             }
             if Date().timeIntervalSince(link.incomingAt) > 30 { link.incoming = nil }
+            if send?.id != id, link.incoming == nil, Date() >= link.nextNameRead {
+                refreshName(of: link)
+            }
             if link.peripheral.state == .disconnected && send?.id != id &&
                 Date().timeIntervalSince(link.lastSeen) > 12 {
                 links[id] = nil
             }
         }
         publishPeers()
+    }
+
+    private func refreshName(of link: Link) {
+        guard link.peripheral.state == .connected, let characteristic = link.nameCharacteristic else { return }
+        link.nextNameRead = Date().addingTimeInterval(4)
+        link.peripheral.readValue(for: characteristic)
+    }
+
+    private func announce(_ name: String, on link: Link) {
+        let peripheral = link.peripheral
+        guard peripheral.state == .connected, link.upload != nil else { return }
+        let capacity = min(64, peripheral.maximumWriteValueLength(for: .withoutResponse) - 1)
+        guard capacity > 0 else { return }
+        var bytes = Data(name.utf8.prefix(capacity))
+        while String(data: bytes, encoding: .utf8) == nil { bytes.removeLast() }
+        write(Data([Frame.available]) + bytes, on: link, purpose: .registration)
+    }
+
+    private func write(_ frame: Data, on link: Link, purpose: WritePurpose) {
+        link.pendingWrites.append(PendingWrite(frame: frame, purpose: purpose))
+        flushWrites(on: link)
+    }
+
+    private func flushWrites(on link: Link) {
+        guard link.writing == nil, !link.pendingWrites.isEmpty,
+              link.peripheral.state == .connected, let upload = link.upload else { return }
+        let next = link.pendingWrites.removeFirst()
+        link.writing = next.purpose
+        link.peripheral.writeValue(next.frame, for: upload, type: .withResponse)
     }
 
     private func finish(_ error: Error? = nil) {
@@ -132,7 +196,7 @@ final class Bluetooth: NSObject, ObservableObject {
     }
 
     private func writeNext(_ link: Link) {
-        guard var outgoing = send, outgoing.id == link.peer.id, let upload = link.upload else { return }
+        guard var outgoing = send, outgoing.id == link.peer.id, link.upload != nil else { return }
         if outgoing.ended {
             finish()
             return
@@ -158,7 +222,7 @@ final class Bluetooth: NSObject, ObservableObject {
         }
         outgoing.lastActivity = Date()
         send = outgoing
-        link.peripheral.writeValue(frame, for: upload, type: .withResponse)
+        write(frame, on: link, purpose: .send)
     }
 
     private func clearLink(_ peripheral: CBPeripheral, error: Error?) {
@@ -167,6 +231,9 @@ final class Bluetooth: NSObject, ObservableObject {
         link.connectingSince = nil
         link.upload = nil
         link.download = nil
+        link.writing = nil
+        link.pendingWrites.removeAll()
+        link.nameCharacteristic = nil
         link.incoming = nil
         link.peer.connected = false
         publishPeers()
@@ -177,7 +244,7 @@ extension Bluetooth: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ manager: CBCentralManager) {
         switch manager.state {
         case .poweredOn:
-            state = receivingName == nil ? "Looking for Pipopu PCs…" : "Looking for PCs while Pipopu is open…"
+            state = "Looking for Pipopu PCs…"
             manager.scanForPeripherals(withServices: [serviceID], options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
             return
         case .unauthorized: state = "Allow Bluetooth access for Pipopu in Settings."
@@ -203,6 +270,8 @@ extension Bluetooth: CBCentralManagerDelegate {
         }
         guard let link = links[peripheral.identifier] else { return }
         link.lastSeen = Date()
+        let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
+        updateFallbackName(advertisedName ?? peripheral.name, on: link)
         connect(link)
     }
 
@@ -220,6 +289,17 @@ extension Bluetooth: CBCentralManagerDelegate {
 }
 
 extension Bluetooth: CBPeripheralDelegate {
+    private func updateFallbackName(_ name: String?, on link: Link) {
+        guard !link.hasServiceName, let name, !name.isEmpty, name != link.peer.name else { return }
+        link.peer.name = name
+        publishPeers()
+    }
+
+    func peripheralDidUpdateName(_ peripheral: CBPeripheral) {
+        guard let link = links[peripheral.identifier] else { return }
+        updateFallbackName(peripheral.name, on: link)
+    }
+
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard error == nil, let service = peripheral.services?.first(where: { $0.uuid == serviceID }) else {
             central?.cancelPeripheralConnection(peripheral)
@@ -238,7 +318,8 @@ extension Bluetooth: CBPeripheralDelegate {
         link.upload = upload
         link.download = chars.first(where: { $0.uuid == downloadID })
         link.connectingSince = nil
-        if let name = chars.first(where: { $0.uuid == nameID }) { peripheral.readValue(for: name) }
+        link.nameCharacteristic = chars.first(where: { $0.uuid == nameID && $0.properties.contains(.read) })
+        refreshName(of: link)
         if let download = link.download, receivingName != nil {
             peripheral.setNotifyValue(true, for: download)
         }
@@ -246,41 +327,59 @@ extension Bluetooth: CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
-        guard let link = links[peripheral.identifier], characteristic.uuid == downloadID,
-              let name = receivingName, let upload = link.upload else { return }
-        guard error == nil, characteristic.isNotifying else {
+        guard let link = links[peripheral.identifier], characteristic.uuid == downloadID else { return }
+        guard error == nil else {
             central?.cancelPeripheralConnection(peripheral)
             return
         }
-        let length = max(0, min(64, peripheral.maximumWriteValueLength(for: .withoutResponse) - 1))
-        peripheral.writeValue(Data([Frame.available]) + Data(name.utf8.prefix(length)), for: upload, type: .withResponse)
+        if characteristic.isNotifying, let name = receivingName {
+            announce(name, on: link)
+        } else if !characteristic.isNotifying && link.peer.connected {
+            link.peer.connected = false
+            publishPeers()
+        }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
-        guard let link = links[peripheral.identifier], characteristic.uuid == uploadID else { return }
-        if error != nil {
+        guard let link = links[peripheral.identifier], characteristic.uuid == uploadID,
+              let purpose = link.writing else { return }
+        link.writing = nil
+        if let error {
             if send?.id == peripheral.identifier { finish(error) }
+            link.pendingWrites.removeAll()
             central?.cancelPeripheralConnection(peripheral)
-        } else if send?.id == peripheral.identifier {
+            return
+        }
+        switch purpose {
+        case .send:
             writeNext(link)
-        } else if link.download?.isNotifying == true && !link.peer.connected {
+        case .registration where receivingName != nil && !link.peer.connected:
             link.peer.connected = true
             publishPeers()
+        case .registration, .acknowledgement:
+            break
         }
+        flushWrites(on: link)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard let link = links[peripheral.identifier], error == nil,
               let frame = characteristic.value, let opcode = frame.first else { return }
         if characteristic.uuid == nameID {
-            let name = String(decoding: frame, as: UTF8.self)
-            if !name.isEmpty { link.peer.name = name; publishPeers() }
+            guard let name = String(data: frame, encoding: .utf8), !name.isEmpty else { return }
+            link.hasServiceName = true
+            if name != link.peer.name {
+                link.peer.name = name
+                publishPeers()
+            }
             return
         }
-        guard characteristic.uuid == downloadID, let upload = link.upload else { return }
+        guard characteristic.uuid == downloadID, link.upload != nil else { return }
         do {
             switch opcode {
-            case Frame.begin: link.incoming = try IncomingTransfer(frame)
+            case Frame.begin:
+                receiveError = nil
+                link.incoming = try IncomingTransfer(frame)
             case Frame.chunk: try link.incoming?.append(frame)
             case Frame.abort:
                 guard frame.count == 5, link.incoming?.token == Frame.readNumber(frame, at: 1) else { return }
@@ -289,13 +388,13 @@ extension Bluetooth: CBPeripheralDelegate {
                 guard let incoming = link.incoming else { return }
                 received = try incoming.finish(frame)
                 link.incoming = nil
-                peripheral.writeValue(Data([Frame.received] + Frame.number(incoming.token)), for: upload, type: .withResponse)
+                write(Data([Frame.received] + Frame.number(incoming.token)), on: link, purpose: .acknowledgement)
             default: return
             }
             link.incomingAt = Date()
         } catch {
             link.incoming = nil
-            result = error.localizedDescription
+            receiveError = error.localizedDescription
         }
     }
 }

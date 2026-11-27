@@ -5,13 +5,16 @@ import UIKit
 
 final class ShareViewController: UIViewController {
     private let bluetooth = Bluetooth()
+    private var isClosing = false
 
     override func viewDidLoad() {
         super.viewDidLoad()
         let items = extensionContext?.inputItems as? [NSExtensionItem] ?? []
         let host = UIHostingController(rootView: ShareView(bluetooth: bluetooth, items: items) { [weak self] in
-            self?.bluetooth.stop()
-            self?.extensionContext?.completeRequest(returningItems: nil)
+            guard let self, !self.isClosing else { return }
+            self.isClosing = true
+            self.bluetooth.stop()
+            self.extensionContext?.completeRequest(returningItems: nil)
         })
         addChild(host)
         host.view.translatesAutoresizingMaskIntoConstraints = false
@@ -95,6 +98,13 @@ private struct ShareView: View {
         .sensoryFeedback(.impact(weight: .light), trigger: sendAttempt)
         .sensoryFeedback(trigger: finishedAttempt) { _, _ in
             bluetooth.sendCompleted ? .success : .error
+        }
+        .task(id: bluetooth.sendCompleted) {
+            guard bluetooth.sendCompleted else { return }
+            // Leave time for the success checkmark and haptic before the host dismisses the extension.
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            close()
         }
         .task {
             do { transfer = try await loadTransfer() }
