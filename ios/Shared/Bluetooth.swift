@@ -44,6 +44,7 @@ final class Bluetooth: NSObject, ObservableObject {
         let incoming: AsyncThrowingStream<Wire, Error>.Continuation
         private var iterator: AsyncThrowingStream<Wire, Error>.Iterator
         var deadline = Date().addingTimeInterval(120)
+        var peerError: String?
 
         init(id: String) {
             self.id = id
@@ -57,9 +58,6 @@ final class Bluetooth: NSObject, ObservableObject {
             let message = try await cursor.next()
             iterator = cursor
             guard let message else { throw TransferError.disconnected }
-            if message.type == "fail" {
-                throw TransferError.message(message.error ?? "The PC declined the transfer.")
-            }
             return message
         }
     }
@@ -225,8 +223,8 @@ final class Bluetooth: NSObject, ObservableObject {
                 sendCompleted = true
                 result = "Sent"
             } catch {
-                result = error.localizedDescription
-                if !Task.isCancelled && link.peer.connected {
+                result = transaction.peerError ?? error.localizedDescription
+                if transaction.peerError == nil && !Task.isCancelled && link.peer.connected {
                     try? await transmit(Wire(type: "cancel", id: transaction.id), on: link)
                 }
             }
@@ -314,8 +312,8 @@ final class Bluetooth: NSObject, ObservableObject {
                 received = transfer
                 try await transmit(Wire(type: "complete", id: id), on: link)
             } catch {
-                receiveError = error.localizedDescription
-                if !Task.isCancelled && link.peer.connected {
+                receiveError = transaction.peerError ?? error.localizedDescription
+                if transaction.peerError == nil && !Task.isCancelled && link.peer.connected {
                     try? await transmit(Wire(type: "fail", id: id, error: error.localizedDescription), on: link)
                 }
             }
@@ -454,8 +452,11 @@ final class Bluetooth: NSObject, ObservableObject {
             } else if message.type == "offer", link.peer.connected {
                 receive(message, on: link)
             } else if let transaction = link.transfer, message.id == transaction.id {
-                if message.type == "cancel" {
-                    transaction.incoming.finish(throwing: TransferError.message("The PC cancelled the transfer."))
+                if message.type == "cancel" || message.type == "fail" {
+                    let failure = message.type == "cancel" ? "The PC cancelled the transfer." :
+                        message.error ?? "The PC declined the transfer."
+                    transaction.peerError = failure
+                    transaction.incoming.finish(throwing: TransferError.message(failure))
                     link.task?.cancel()
                     if confirmation?.0 === link { answerPairing(false) }
                 } else if case .dropped = transaction.incoming.yield(message) {

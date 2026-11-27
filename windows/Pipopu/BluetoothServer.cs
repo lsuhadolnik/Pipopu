@@ -41,14 +41,13 @@ internal sealed class BluetoothServer : IDisposable
         internal string Id { get; } = id;
         internal CancellationTokenSource Lifetime { get; } = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         internal Channel<Wire> Mail { get; } = Channel.CreateBounded<Wire>(8);
+        internal volatile string? PeerError;
 
         internal async Task<Wire> NextAsync(TimeSpan timeout)
         {
             using var deadline = CancellationTokenSource.CreateLinkedTokenSource(Lifetime.Token);
             deadline.CancelAfter(timeout);
             var message = await Mail.Reader.ReadAsync(deadline.Token);
-            if (message.Type == "fail")
-                throw new IOException(message.Error ?? "The other device refused the transfer.");
             return message;
         }
 
@@ -257,6 +256,8 @@ internal sealed class BluetoothServer : IDisposable
         }
         catch (Exception error)
         {
+            if (transaction.PeerError is { } message)
+                throw new IOException(message, error);
             await ReplyBestEffortAsync(link, new Wire(cancellation.IsCancellationRequested ? "cancel" : "fail",
                 id, Error: error.Message));
             throw;
@@ -345,7 +346,8 @@ internal sealed class BluetoothServer : IDisposable
             }
             catch (Exception error)
             {
-                await ReplyBestEffortAsync(link, new Wire("fail", id, Error: error.Message));
+                if (transaction.PeerError is null)
+                    await ReplyBestEffortAsync(link, new Wire("fail", id, Error: error.Message));
             }
             finally
             {
@@ -560,8 +562,12 @@ internal sealed class BluetoothServer : IDisposable
             }
             else if (link.Active is { } active && active.Id == message.Id)
             {
-                if (message.Type == "cancel")
+                if (message.Type is "fail" or "cancel")
+                {
+                    active.PeerError = message.Type == "cancel" ? "The other device cancelled the transfer." :
+                        message.Error ?? "The other device declined the transfer.";
                     active.Lifetime.Cancel();
+                }
                 else if (!active.Mail.Writer.TryWrite(message))
                     active.Lifetime.Cancel();
                 return;
