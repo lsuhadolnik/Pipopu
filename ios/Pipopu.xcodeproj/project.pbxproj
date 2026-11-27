@@ -6,6 +6,7 @@
 	objects = {
 		000000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Pipopu/PipopuApp.swift; sourceTree = "<group>";};
 		000000000000000000000002 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareExtension/ShareViewController.swift; sourceTree = "<group>";};
+		000000000000000000000022 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareExtension/SharedText.swift; sourceTree = "<group>";};
 		000000000000000000000003 = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = ShareExtension/Info.plist; sourceTree = "<group>";};
 		000000000000000000000004 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shared/Transfer.swift; sourceTree = "<group>";};
 		000000000000000000000005 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shared/Bluetooth.swift; sourceTree = "<group>";};
@@ -18,11 +19,12 @@
 		00000000000000000000000C = {isa = PBXBuildFile; fileRef = 000000000000000000000002;};
 		00000000000000000000000D = {isa = PBXBuildFile; fileRef = 000000000000000000000004;};
 		00000000000000000000000E = {isa = PBXBuildFile; fileRef = 000000000000000000000005;};
-		00000000000000000000000F = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (00000000000000000000000C, 00000000000000000000000D, 00000000000000000000000E, ); runOnlyForDeploymentPostprocessing = 0;};
+		000000000000000000000023 = {isa = PBXBuildFile; fileRef = 000000000000000000000022;};
+		00000000000000000000000F = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (00000000000000000000000C, 00000000000000000000000D, 00000000000000000000000E, 000000000000000000000023, ); runOnlyForDeploymentPostprocessing = 0;};
 		000000000000000000000010 = {isa = PBXBuildFile; fileRef = 000000000000000000000007; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); };};
 		000000000000000000000011 = {isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = ""; dstSubfolderSpec = 13; files = (000000000000000000000010, ); name = "Embed App Extensions"; runOnlyForDeploymentPostprocessing = 0;};
 		000000000000000000000012 = {isa = PBXGroup; children = (000000000000000000000006, 000000000000000000000007, ); name = Products; sourceTree = "<group>";};
-		000000000000000000000013 = {isa = PBXGroup; children = (000000000000000000000001, 000000000000000000000002, 000000000000000000000003, 000000000000000000000004, 000000000000000000000005, 000000000000000000000012, ); sourceTree = "<group>";};
+		000000000000000000000013 = {isa = PBXGroup; children = (000000000000000000000001, 000000000000000000000002, 000000000000000000000022, 000000000000000000000003, 000000000000000000000004, 000000000000000000000005, 000000000000000000000012, ); sourceTree = "<group>";};
 		000000000000000000000016 = {isa = PBXContainerItemProxy; containerPortal = 000000000000000000000014; proxyType = 1; remoteGlobalIDString = 000000000000000000000015; remoteInfo = PipopuShare;};
 		000000000000000000000017 = {isa = PBXTargetDependency; target = 000000000000000000000015; targetProxy = 000000000000000000000016;};
 		000000000000000000000018 = {isa = XCBuildConfiguration; buildSettings = {

@@ -8,9 +8,8 @@ final class ShareViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        let providers = (extensionContext?.inputItems as? [NSExtensionItem] ?? [])
-            .flatMap { $0.attachments ?? [] }
-        let host = UIHostingController(rootView: ShareView(bluetooth: bluetooth, providers: providers) { [weak self] in
+        let items = extensionContext?.inputItems as? [NSExtensionItem] ?? []
+        let host = UIHostingController(rootView: ShareView(bluetooth: bluetooth, items: items) { [weak self] in
             self?.bluetooth.stop()
             self?.extensionContext?.completeRequest(returningItems: nil)
         })
@@ -32,7 +31,7 @@ final class ShareViewController: UIViewController {
 
 private struct ShareView: View {
     @ObservedObject var bluetooth: Bluetooth
-    let providers: [NSItemProvider]
+    let items: [NSExtensionItem]
     let close: () -> Void
     @State private var transfer: Transfer?
     @State private var error: String?
@@ -81,7 +80,7 @@ private struct ShareView: View {
     }
 
     private func loadTransfer() async throws -> Transfer {
-        for provider in providers {
+        for provider in items.flatMap({ $0.attachments ?? [] }) {
             if let identifier = provider.registeredTypeIdentifiers.first(where: {
                 UTType($0)?.conforms(to: .image) == true
             }) {
@@ -95,33 +94,7 @@ private struct ShareView: View {
                 }
             }
         }
-        for provider in providers {
-            if provider.canLoadObject(ofClass: NSString.self) {
-                let value: String = try await withCheckedThrowingContinuation { continuation in
-                    _ = provider.loadObject(ofClass: NSString.self) { value, error in
-                        guard let value = value as? String else {
-                            continuation.resume(throwing: error ?? TransferError.invalid)
-                            return
-                        }
-                        continuation.resume(returning: value)
-                    }
-                }
-                return try Transfer(kind: .text, data: Data(value.utf8))
-            }
-            if provider.canLoadObject(ofClass: NSURL.self) {
-                let value: URL = try await withCheckedThrowingContinuation { continuation in
-                    _ = provider.loadObject(ofClass: NSURL.self) { value, error in
-                        guard let value = value as? URL else {
-                            continuation.resume(throwing: error ?? TransferError.invalid)
-                            return
-                        }
-                        continuation.resume(returning: value)
-                    }
-                }
-                return try Transfer(kind: .text, data: Data(value.absoluteString.utf8))
-            }
-        }
-        throw TransferError.invalid
+        return try await SharedText.load(from: items)
     }
 
     private static func loadImage(at url: URL, identifier: String) throws -> Transfer {
