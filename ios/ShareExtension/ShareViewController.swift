@@ -178,10 +178,19 @@ private struct ShareView: View {
             .frame(maxWidth: .infinity)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(DeviceButtonStyle())
         .disabled(transfer == nil || bluetooth.progress != nil || bluetooth.sendCompleted)
+        .opacity(!isSelected && (bluetooth.progress != nil || bluetooth.sendCompleted) ? 0.55 : 1)
         .accessibilityLabel("Send to " + peer.name)
         .accessibilityValue(progress?.formatted(.percent.precision(.fractionLength(0))) ?? (delivered ? "Sent" : ""))
+    }
+
+    private struct DeviceButtonStyle: ButtonStyle {
+        func makeBody(configuration: Configuration) -> some View {
+            configuration.label
+                .scaleEffect(configuration.isPressed ? 0.95 : 1)
+                .animation(.snappy(duration: 0.18), value: configuration.isPressed)
+        }
     }
 
     private func loadTransfer() async throws -> Transfer {
