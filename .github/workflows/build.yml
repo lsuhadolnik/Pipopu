@@ -1,0 +1,26 @@
+name: Build apps
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  apple:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build iPhone/iPad app and Share Sheet extension
+        run: >-
+          xcodebuild -project ios/Pipopu.xcodeproj -scheme Pipopu
+          -configuration Debug -destination 'generic/platform=iOS'
+          -derivedDataPath .build/ci-ios CODE_SIGNING_ALLOWED=NO build
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build Windows tray app
+        run: dotnet build windows/Pipopu/Pipopu.csproj -c Release

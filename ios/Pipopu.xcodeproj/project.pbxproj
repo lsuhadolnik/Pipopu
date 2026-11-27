@@ -1,0 +1,107 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 56;
+	objects = {
+		000000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Pipopu/PipopuApp.swift; sourceTree = "<group>";};
+		000000000000000000000002 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareExtension/ShareViewController.swift; sourceTree = "<group>";};
+		000000000000000000000003 = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = ShareExtension/Info.plist; sourceTree = "<group>";};
+		000000000000000000000004 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shared/Transfer.swift; sourceTree = "<group>";};
+		000000000000000000000005 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shared/Bluetooth.swift; sourceTree = "<group>";};
+		000000000000000000000006 = {isa = PBXFileReference; explicitFileType = wrapper.application; path = Pipopu.app; sourceTree = BUILT_PRODUCTS_DIR;};
+		000000000000000000000007 = {isa = PBXFileReference; explicitFileType = wrapper.app-extension; path = PipopuShare.appex; sourceTree = BUILT_PRODUCTS_DIR;};
+		000000000000000000000008 = {isa = PBXBuildFile; fileRef = 000000000000000000000001;};
+		000000000000000000000009 = {isa = PBXBuildFile; fileRef = 000000000000000000000004;};
+		00000000000000000000000A = {isa = PBXBuildFile; fileRef = 000000000000000000000005;};
+		00000000000000000000000B = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000008, 000000000000000000000009, 00000000000000000000000A, ); runOnlyForDeploymentPostprocessing = 0;};
+		00000000000000000000000C = {isa = PBXBuildFile; fileRef = 000000000000000000000002;};
+		00000000000000000000000D = {isa = PBXBuildFile; fileRef = 000000000000000000000004;};
+		00000000000000000000000E = {isa = PBXBuildFile; fileRef = 000000000000000000000005;};
+		00000000000000000000000F = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (00000000000000000000000C, 00000000000000000000000D, 00000000000000000000000E, ); runOnlyForDeploymentPostprocessing = 0;};
+		000000000000000000000010 = {isa = PBXBuildFile; fileRef = 000000000000000000000007; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); };};
+		000000000000000000000011 = {isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = ""; dstSubfolderSpec = 13; files = (000000000000000000000010, ); name = "Embed App Extensions"; runOnlyForDeploymentPostprocessing = 0;};
+		000000000000000000000012 = {isa = PBXGroup; children = (000000000000000000000006, 000000000000000000000007, ); name = Products; sourceTree = "<group>";};
+		000000000000000000000013 = {isa = PBXGroup; children = (000000000000000000000001, 000000000000000000000002, 000000000000000000000003, 000000000000000000000004, 000000000000000000000005, 000000000000000000000012, ); sourceTree = "<group>";};
+		000000000000000000000016 = {isa = PBXContainerItemProxy; containerPortal = 000000000000000000000014; proxyType = 1; remoteGlobalIDString = 000000000000000000000015; remoteInfo = PipopuShare;};
+		000000000000000000000017 = {isa = PBXTargetDependency; target = 000000000000000000000015; targetProxy = 000000000000000000000016;};
+		000000000000000000000018 = {isa = XCBuildConfiguration; buildSettings = {
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SWIFT_VERSION = 5.0;
+				CODE_SIGN_STYLE = Automatic;
+				PIPOPU_BUNDLE_ID = com.pipopu.app;
+				MARKETING_VERSION = 0.1.0;
+				CURRENT_PROJECT_VERSION = 1;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ENABLE_TESTABILITY = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				DEBUG_INFORMATION_FORMAT = dwarf;
+			}; name = Debug;};
+		000000000000000000000019 = {isa = XCBuildConfiguration; buildSettings = {
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SWIFT_VERSION = 5.0;
+				CODE_SIGN_STYLE = Automatic;
+				PIPOPU_BUNDLE_ID = com.pipopu.app;
+				MARKETING_VERSION = 0.1.0;
+				CURRENT_PROJECT_VERSION = 1;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+			}; name = Release;};
+		00000000000000000000001A = {isa = XCConfigurationList; buildConfigurations = (000000000000000000000018, 000000000000000000000019, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release;};
+		00000000000000000000001B = {isa = XCBuildConfiguration; buildSettings = {
+				PRODUCT_NAME = Pipopu;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(PIPOPU_BUNDLE_ID)";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Pipopu;
+				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "Pipopu uses Bluetooth to find Windows PCs and transfer text, images, and files.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				"INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad" = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+			}; name = Debug;};
+		00000000000000000000001C = {isa = XCBuildConfiguration; buildSettings = {
+				PRODUCT_NAME = Pipopu;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(PIPOPU_BUNDLE_ID)";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Pipopu;
+				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "Pipopu uses Bluetooth to find Windows PCs and transfer text, images, and files.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				"INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad" = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+			}; name = Release;};
+		00000000000000000000001D = {isa = XCConfigurationList; buildConfigurations = (00000000000000000000001B, 00000000000000000000001C, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release;};
+		00000000000000000000001E = {isa = XCBuildConfiguration; buildSettings = {
+				PRODUCT_NAME = PipopuShare;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(PIPOPU_BUNDLE_ID).ShareExtension";
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = ShareExtension/Info.plist;
+				SKIP_INSTALL = YES;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks";
+			}; name = Debug;};
+		00000000000000000000001F = {isa = XCBuildConfiguration; buildSettings = {
+				PRODUCT_NAME = PipopuShare;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(PIPOPU_BUNDLE_ID).ShareExtension";
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = ShareExtension/Info.plist;
+				SKIP_INSTALL = YES;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks";
+			}; name = Release;};
+		000000000000000000000020 = {isa = XCConfigurationList; buildConfigurations = (00000000000000000000001E, 00000000000000000000001F, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release;};
+		000000000000000000000021 = {isa = PBXNativeTarget; buildConfigurationList = 00000000000000000000001D; buildPhases = (00000000000000000000000B, 000000000000000000000011, ); buildRules = (); dependencies = (000000000000000000000017, ); name = Pipopu; productName = Pipopu; productReference = 000000000000000000000006; productType = "com.apple.product-type.application";};
+		000000000000000000000015 = {isa = PBXNativeTarget; buildConfigurationList = 000000000000000000000020; buildPhases = (00000000000000000000000F, ); buildRules = (); dependencies = (); name = PipopuShare; productName = PipopuShare; productReference = 000000000000000000000007; productType = "com.apple.product-type.app-extension";};
+		000000000000000000000014 = {isa = PBXProject; attributes = {LastUpgradeCheck = 2600; }; buildConfigurationList = 00000000000000000000001A; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base, ); mainGroup = 000000000000000000000013; productRefGroup = 000000000000000000000012; projectDirPath = ""; projectRoot = ""; targets = (000000000000000000000021, 000000000000000000000015, );};
+	};
+	rootObject = 000000000000000000000014;
+}

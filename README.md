@@ -26,7 +26,9 @@ Use Xcode and an iPhone or iPad running iOS or iPadOS 17 or later. Sign in to yo
 
 Replace the team and bundle ID with values for your Apple account. The extension bundle ID derives from the app ID. The script builds and installs both targets, then streams the app console by default. With `--lldb`, it attaches before the app begins running. Use `continue` at the LLDB prompt when ready. To debug the Share Sheet extension, attach to `PipopuShare` from Xcode while bringing up the extension on the device.
 
-To send from Apple, choose **Share → Pipopu** in an app such as Photos or Notes. Select a nearby PC from the list. If Pipopu is hidden, open **More** in the Share Sheet and enable it. The extension handles one item at a time and treats a shared web URL as text. It keeps JPEG and PNG originals that fit and converts other or larger images to a smaller JPEG for Windows clipboard compatibility.
+Open Pipopu once and grant Bluetooth access. Then choose **Share → Pipopu** in an app such as Photos or Notes and select a nearby PC. If Pipopu is hidden, open **More** in the Share Sheet and enable it. The extension handles one item at a time and treats a shared web URL as text. It keeps JPEG and PNG originals that fit and converts other or larger images to a smaller JPEG for Windows clipboard compatibility.
+
+If Xcode reports that it could not mount the developer disk image, check for [Xcode hardware support updates](https://developer.apple.com/documentation/xcode/downloading-and-installing-additional-xcode-components) for the device's OS version.
 
 ## BLE behavior
 
