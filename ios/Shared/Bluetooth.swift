@@ -73,6 +73,7 @@ final class Bluetooth: NSObject, ObservableObject {
         var incomingAt = Date.distantPast
         var hello: Data?
         var session: SecureSession?
+        var version: Int?
         var writes: [Write] = []
         var writeAt = Date.distantPast
         var nextNameRefresh = Date.distantPast
@@ -404,7 +405,12 @@ final class Bluetooth: NSObject, ObservableObject {
     private func transmit(_ message: Wire, on link: Link, progress: ((Double) -> Void)? = nil) async throws {
         try Task.checkCancellation()
         guard let session = link.session else { throw TransferError.disconnected }
-        try await enqueue(try session.seal(message), on: link, progress: progress)
+        var outgoing = message
+        if message.type != "ready" {
+            guard let version = link.version else { throw TransferError.disconnected }
+            outgoing.version = version
+        }
+        try await enqueue(try session.seal(outgoing), on: link, progress: progress)
     }
 
     private func enqueue(_ packet: Data, on link: Link, progress: ((Double) -> Void)? = nil) async throws {
@@ -445,10 +451,21 @@ final class Bluetooth: NSObject, ObservableObject {
         if let session = link.session {
             let message = try session.open(packet)
             if message.type == "ready", let name = message.name {
+                guard message.error == nil,
+                      let selected = WireProtocol.negotiate(message.protocolMin, message.protocolMax),
+                      (message.version ?? WireProtocol.legacy) == selected,
+                      link.version == nil || link.version == selected else {
+                    let error = message.error ?? "Update Pipopu on both devices to use a compatible transfer protocol."
+                    state = error
+                    throw TransferError.message(error)
+                }
+                link.version = selected
                 link.peer.name = name
                 link.peer.connected = true
                 link.connectingSince = nil
                 publishPeers()
+            } else if link.version == nil || (message.version ?? WireProtocol.legacy) != link.version {
+                throw TransferError.invalid
             } else if message.type == "offer", link.peer.connected {
                 receive(message, on: link)
             } else if let transaction = link.transfer, message.id == transaction.id {
@@ -476,7 +493,10 @@ final class Bluetooth: NSObject, ObservableObject {
         let device = receivingName ?? UIDevice.current.model
         let name = String(decoding: device.utf8.prefix(60), as: UTF8.self)
         Task {
-            do { try await transmit(Wire(type: "ready", name: name, receive: receivingName != nil), on: link) }
+            do {
+                try await transmit(Wire(type: "ready", name: name, receive: receivingName != nil,
+                                        protocolMin: WireProtocol.minimum, protocolMax: WireProtocol.current), on: link)
+            }
             catch { central?.cancelPeripheralConnection(link.peripheral) }
         }
     }
@@ -495,6 +515,7 @@ final class Bluetooth: NSObject, ObservableObject {
         link.incoming = nil
         link.hello = nil
         link.session = nil
+        link.version = nil
         link.peer.connected = false
     }
 }

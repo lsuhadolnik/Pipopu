@@ -11,11 +11,11 @@ internal partial class ReceivedPopup : FlyoutWindow
     private readonly Transfer transfer;
     private readonly BitmapSource? image;
 
-    internal ReceivedPopup(Transfer transfer)
+    internal ReceivedPopup(Transfer transfer, Task<string>? automaticSave = null)
     {
         this.transfer = transfer;
         InitializeComponent();
-        Closed += (_, _) => transfer.File?.Dispose();
+        Closed += (_, _) => ReceivedFiles.Release(transfer, automaticSave);
 
         HeadingText.Text = transfer.Kind switch
         {
@@ -56,6 +56,15 @@ internal partial class ReceivedPopup : FlyoutWindow
             SaveButton.SetResourceReference(StyleProperty, "QuietButton");
             SaveButton.Margin = new Thickness(8, 0, 0, 0);
         }
+        if (automaticSave is not null)
+            Loaded += async (_, _) =>
+            {
+                if (!automaticSave.IsCompleted)
+                    Status.Text = "Saving automatically…";
+                string result = await automaticSave;
+                if (IsVisible)
+                    Status.Text = result;
+            };
     }
 
     private void CloseClick(object sender, RoutedEventArgs e) => Close();
@@ -73,13 +82,7 @@ internal partial class ReceivedPopup : FlyoutWindow
 
     private void SaveClick(object sender, RoutedEventArgs e) => Run(() =>
     {
-        string name = Path.GetFileName(transfer.Name.Replace('/', '\\'));
-        var invalid = Path.GetInvalidFileNameChars();
-        name = new string(name.Select(character => invalid.Contains(character) ? '_' : character).ToArray())
-            .TrimEnd(' ', '.');
-        if (name.Length == 0)
-            name = "Pipopu transfer";
-        var picker = new SaveFileDialog { FileName = name };
+        var picker = new SaveFileDialog { FileName = ReceivedFiles.SafeName(transfer.Name) };
         if (picker.ShowDialog(this) == true)
         {
             using var source = transfer.OpenRead();

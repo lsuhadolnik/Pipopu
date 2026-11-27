@@ -12,10 +12,12 @@ private struct ReceiverView: View {
     @Environment(\.scenePhase) private var phase
     @StateObject private var bluetooth = Bluetooth()
     @AppStorage("receiverName") private var receiverName = ""
+    @AppStorage("saveReceivedFiles") private var saveReceivedFiles = false
     @State private var listening = true
     @State private var exporting = false
     @State private var status = ""
     @State private var fileExport: ExportFile?
+    @State private var latestReceipt: UUID?
     @State private var draft = ""
     @State private var attachment: Transfer?
     @State private var importing = false
@@ -79,6 +81,7 @@ private struct ReceiverView: View {
                 }
                 Section {
                     Toggle("Available to receive", isOn: $listening)
+                    Toggle("Save received files automatically", isOn: $saveReceivedFiles)
                     TextField("Name on Windows", text: $receiverName, prompt: Text(UIDevice.current.model))
                         .onSubmit { updateListening() }
                     if let message = bluetooth.receiveError {
@@ -87,7 +90,7 @@ private struct ReceiverView: View {
                 } header: {
                     Text("Receiving")
                 } footer: {
-                    Text("Keep Pipopu open to appear as a recipient on Windows.")
+                    Text("Keep Pipopu open to receive. Automatically saved files appear in On My iPhone or iPad → Pipopu → Received in Files.")
                 }
                 if !status.isEmpty { Text(status).foregroundStyle(.secondary) }
             }
@@ -100,7 +103,7 @@ private struct ReceiverView: View {
         .onChange(of: phase) { _, _ in updateListening() }
         .onChange(of: listening) { _, _ in updateListening() }
         .onChange(of: draft) { _, _ in sendStatus = "" }
-        .onChange(of: bluetooth.received?.id) { _, _ in status = "" }
+        .onReceive(bluetooth.$received, perform: receive)
         .sensoryFeedback(.impact(weight: .light), trigger: sendAttempt)
         .sensoryFeedback(trigger: finishedAttempt) { _, _ in
             bluetooth.sendCompleted ? .success : .error
@@ -272,10 +275,7 @@ private struct ReceiverView: View {
     }
 
     private var exportName: String {
-        guard let transfer = bluetooth.received, !transfer.name.isEmpty else { return "Pipopu transfer" }
-        let name = transfer.name.replacingOccurrences(of: "\\", with: "/")
-        let basename = name.split(separator: "/").last.map(String.init) ?? ""
-        return basename.isEmpty || basename == "." || basename == ".." ? "Pipopu transfer" : basename
+        ReceivedFileArchive.name(bluetooth.received?.name ?? "")
     }
 
     private var exportType: UTType {
@@ -290,6 +290,28 @@ private struct ReceiverView: View {
         return UIImage(data: transfer.data)
     }
 
+    private func receive(_ transfer: Transfer?) {
+        guard latestReceipt != transfer?.id else { return }
+        latestReceipt = transfer?.id
+        status = ""
+        guard saveReceivedFiles, let transfer, transfer.kind != .text else { return }
+
+        status = "Saving automatically…"
+        Task {
+            let result = await Task.detached(priority: .utility) {
+                do {
+                    try ReceivedFileArchive.save(transfer)
+                    return "Saved to Files."
+                } catch {
+                    return "Automatic save failed. " + error.localizedDescription
+                }
+            }.value
+            if latestReceipt == transfer.id {
+                status = result
+            }
+        }
+    }
+
     private var displayName: String {
         let label = receiverName.trimmingCharacters(in: .whitespacesAndNewlines)
         return label.isEmpty ? UIDevice.current.model : label
@@ -302,6 +324,52 @@ private struct ReceiverView: View {
             bluetooth.updateReceivingName(name)
         } else if phase == .background {
             bluetooth.stop()
+        }
+    }
+}
+
+private enum ReceivedFileArchive {
+    static func name(_ original: String) -> String {
+        let path = original.replacingOccurrences(of: "\\", with: "/")
+        let basename = path.split(separator: "/").last.map(String.init) ?? ""
+        let clean = basename.unicodeScalars.map { CharacterSet.controlCharacters.contains($0) ? "_" : String($0) }
+            .joined().trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ".")))
+        return clean.isEmpty ? "Pipopu transfer" : clean
+    }
+
+    static func save(_ transfer: Transfer) throws {
+        let files = FileManager.default
+        let documents = try files.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        let folder = documents.appendingPathComponent("Received", isDirectory: true)
+        try files.createDirectory(at: folder, withIntermediateDirectories: true)
+        let staging = folder.appendingPathComponent(".pipopu-" + UUID().uuidString)
+        defer { try? files.removeItem(at: staging) }
+        if let file = transfer.file {
+            try files.copyItem(at: file.url, to: staging)
+        } else {
+            try transfer.data.write(to: staging)
+        }
+
+        let original = name(transfer.name)
+        let originalExt = (original as NSString).pathExtension
+        let ext = originalExt.utf8.count <= 32 ? originalExt : ""
+        let stem = ext.isEmpty ? original : (original as NSString).deletingPathExtension
+        var number = 1
+        while true {
+            let suffix = number == 1 ? "" : " (" + String(number) + ")"
+            let ending = suffix + (ext.isEmpty ? "" : "." + ext)
+            var filename = stem
+            while filename.utf8.count + ending.utf8.count > 255 && filename.count > 1 {
+                filename.removeLast()
+            }
+            let destination = folder.appendingPathComponent(filename + ending)
+            do {
+                try files.moveItem(at: staging, to: destination)
+                return
+            } catch {
+                guard files.fileExists(atPath: destination.path) else { throw error }
+                number += 1
+            }
         }
     }
 }

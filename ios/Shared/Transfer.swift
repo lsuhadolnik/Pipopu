@@ -1,8 +1,8 @@
 import Foundation
 import UniformTypeIdentifiers
 
-struct Transfer: Identifiable {
-    enum Kind: UInt8 { case text = 1, image, file }
+struct Transfer: Identifiable, Sendable {
+    enum Kind: UInt8, Sendable { case text = 1, image, file }
     static let limit = 500_000
     static let textLimit = 3_000_000
     static let fileLimit: Int64 = 5_000_000_000

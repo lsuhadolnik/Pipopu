@@ -9,7 +9,24 @@ namespace Pipopu;
 internal sealed record Wire(
     string Type, string? Id = null, string? Name = null, int Kind = 0, long Size = 0,
     bool Pair = false, byte[]? Data = null, string[]? Urls = null, string? Route = null, string? Error = null,
-    bool Receive = false);
+    bool Receive = false, int? ProtocolMin = null, int? ProtocolMax = null, int? Version = null);
+
+internal static class WireProtocol
+{
+    internal const int Legacy = 2;
+    internal const int Minimum = 2;
+    internal const int Current = 2;
+
+    internal static int? Negotiate(int? minimum, int? maximum)
+    {
+        if (minimum is null && maximum is null)
+            return Minimum <= Legacy && Legacy <= Current ? Legacy : null;
+        if (minimum is not { } low || maximum is not { } high || low < 1 || high < low)
+            return null;
+        int selected = Math.Min(Current, high);
+        return selected >= Math.Max(Minimum, low) ? selected : null;
+    }
+}
 
 internal sealed class TrustStore
 {

@@ -35,15 +35,20 @@ internal static class Program
 
 internal sealed class TrayApp : IDisposable
 {
+    private sealed record Receipt(Transfer Transfer, Task<string>? Save);
+
     private readonly Application app;
     private readonly BluetoothServer server = new();
     private readonly Composer composer;
     private readonly Forms.NotifyIcon tray;
     private readonly System.Drawing.Icon appIcon;
     private readonly Forms.ContextMenuStrip menu = new();
-    private readonly Queue<Transfer> receipts = new();
+    private readonly Queue<Receipt> receipts = new();
+    private readonly SettingsStore settings = new();
+    private readonly CancellationTokenSource lifetime = new();
     private bool exiting;
     private ReceivedPopup? popup;
+    private Window? settingsWindow;
 
     internal TrayApp(Application app)
     {
@@ -53,7 +58,7 @@ internal sealed class TrayApp : IDisposable
         appIcon = new System.Drawing.Icon(iconStream, Forms.SystemInformation.SmallIconSize);
         menu.Items.Add("Open Pipopu", null, (_, _) => ShowComposer());
         menu.Items.Add("Trusted devices…", null, (_, _) => SettingsWindows.Trusted(server));
-        menu.Items.Add("OneDrive fallback…", null, (_, _) => SettingsWindows.Cloud(server.Cloud));
+        menu.Items.Add("Settings…", null, (_, _) => ShowSettings());
         menu.Items.Add("Exit", null, (_, _) =>
         {
             exiting = true;
@@ -76,7 +81,17 @@ internal sealed class TrayApp : IDisposable
             SettingsWindows.ConfirmAsync(app.Dispatcher, name, code, cancellation);
         server.TransferReceived += transfer => OnUI(() =>
         {
-            receipts.Enqueue(transfer);
+            if (exiting)
+            {
+                transfer.File?.Dispose();
+                return;
+            }
+            var preferences = settings.Current;
+            var cancellation = lifetime.Token;
+            Task<string>? save = preferences.AutoSave && (transfer.Kind is TransferKind.Image or TransferKind.File)
+                ? Task.Run(() => ReceivedFiles.SaveAsync(transfer, preferences, server.Cloud, cancellation))
+                : null;
+            receipts.Enqueue(new Receipt(transfer, save));
             ShowReceived();
         });
     }
@@ -90,11 +105,24 @@ internal sealed class TrayApp : IDisposable
         composer.Present();
     }
 
+    private void ShowSettings()
+    {
+        if (settingsWindow is null)
+        {
+            settingsWindow = SettingsWindows.Settings(settings, server.Cloud);
+            settingsWindow.Closed += (_, _) => settingsWindow = null;
+            settingsWindow.Show();
+        }
+        if (settingsWindow.WindowState == WindowState.Minimized)
+            settingsWindow.WindowState = WindowState.Normal;
+        settingsWindow.Activate();
+    }
+
     private void ShowReceived()
     {
-        if (exiting || popup is not null || !receipts.TryDequeue(out var transfer))
+        if (exiting || popup is not null || !receipts.TryDequeue(out var receipt))
             return;
-        var received = new ReceivedPopup(transfer);
+        var received = new ReceivedPopup(receipt.Transfer, receipt.Save);
         received.Closed += (_, _) =>
         {
             popup = null;
@@ -110,7 +138,9 @@ internal sealed class TrayApp : IDisposable
         appIcon.Dispose();
         menu.Dispose();
         server.Dispose();
-        foreach (var transfer in receipts)
-            transfer.File?.Dispose();
+        lifetime.Cancel();
+        foreach (var receipt in receipts)
+            ReceivedFiles.Release(receipt.Transfer, receipt.Save);
+        lifetime.Dispose();
     }
 }

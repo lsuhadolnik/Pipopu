@@ -33,6 +33,7 @@ internal sealed class BluetoothServer : IDisposable
         internal SemaphoreSlim Writing { get; } = new(1);
         internal string Name = "";
         internal bool Receives;
+        internal int? Version;
         internal Transaction? Active;
     }
 
@@ -414,7 +415,12 @@ internal sealed class BluetoothServer : IDisposable
     private async Task SendPacketAsync(Link link, Wire packet, CancellationToken cancellation, IProgress<int>? progress = null)
     {
         await link.Writing.WaitAsync(cancellation);
-        try { await IndicateAsync(link.Client, link.Session.Seal(packet), cancellation, progress); }
+        try
+        {
+            if (packet.Type != "ready")
+                packet = packet with { Version = link.Version ?? throw new IOException("Pairing protocol is unavailable.") };
+            await IndicateAsync(link.Client, link.Session.Seal(packet), cancellation, progress);
+        }
         finally { link.Writing.Release(); }
     }
 
@@ -542,6 +548,7 @@ internal sealed class BluetoothServer : IDisposable
         Wire message;
         Transaction? inbound = null;
         bool busy = false;
+        bool incompatible = false;
         lock (gate)
         {
             if (!links.TryGetValue(id, out link!))
@@ -550,8 +557,23 @@ internal sealed class BluetoothServer : IDisposable
             if (message.Type == "ready" && link.Active is null &&
                 message.Name is { } name && IsValidName(name))
             {
-                link.Name = name;
-                link.Receives = message.Receive;
+                int? version = WireProtocol.Negotiate(message.ProtocolMin, message.ProtocolMax);
+                incompatible = version is null || (link.Version is int previous && previous != version);
+                if (!incompatible)
+                {
+                    link.Version = version;
+                    link.Name = name;
+                    link.Receives = message.Receive;
+                }
+            }
+            else if (link.Version is null || (message.Version ?? WireProtocol.Legacy) != link.Version)
+            {
+                incompatible = true;
+                if (link.Active is { } transfer)
+                {
+                    transfer.PeerError = "The other device changed the transfer protocol.";
+                    transfer.Lifetime.Cancel();
+                }
             }
             else if (message.Type == "offer" && message.Id is { } transferId && link.Name.Length > 0)
             {
@@ -576,10 +598,14 @@ internal sealed class BluetoothServer : IDisposable
                 return;
         }
 
-        if (message.Type == "ready")
+        if (incompatible || message.Type == "ready")
         {
-            await ReplyBestEffortAsync(link, new Wire("ready", Name: DeviceName));
-            PeersChanged?.Invoke();
+            await ReplyBestEffortAsync(link, new Wire("ready", Name: DeviceName,
+                ProtocolMin: WireProtocol.Minimum, ProtocolMax: WireProtocol.Current,
+                Version: incompatible ? null : link.Version,
+                Error: incompatible ? "Update Pipopu on both devices to use a compatible transfer protocol." : null));
+            if (!incompatible)
+                PeersChanged?.Invoke();
         }
         else if (inbound is not null)
             await ReceiveAsync(link, inbound, message);

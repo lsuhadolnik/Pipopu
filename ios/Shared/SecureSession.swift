@@ -14,6 +14,24 @@ struct Wire: Codable {
     var route: String? = nil
     var error: String? = nil
     var receive: Bool? = nil
+    var protocolMin: Int? = nil
+    var protocolMax: Int? = nil
+    var version: Int? = nil
+}
+
+enum WireProtocol {
+    static let legacy = 2
+    static let minimum = 2
+    static let current = 2
+
+    static func negotiate(_ minimum: Int?, _ maximum: Int?) -> Int? {
+        if minimum == nil && maximum == nil {
+            return (Self.minimum...current).contains(legacy) ? legacy : nil
+        }
+        guard let minimum, let maximum, minimum > 0, maximum >= minimum else { return nil }
+        let selected = min(maximum, current)
+        return selected >= max(Self.minimum, minimum) ? selected : nil
+    }
 }
 
 struct PeerTrust: Identifiable {

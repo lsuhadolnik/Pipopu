@@ -49,19 +49,23 @@ Install this version on both devices. When either side sends to a new device, co
 
 For large files, Pipopu on Windows starts a temporary HTTP endpoint on an active private IPv4 address. The Apple device probes it to see if the two devices can communicate. This works with Windows on Ethernet as well as Wi-Fi if the devices can reach each other. If Windows Firewall prompts, allow Pipopu on the private network. Pipopu encrypts file data before making it available over HTTP or OneDrive.
 
-If the local endpoint is unreachable, configure **OneDrive fallback** in the Windows tray menu:
-
-1. In the Microsoft Entra admin center, register a public-client application that supports the accounts you want to use. To support both personal Microsoft and work or school accounts, select the corresponding multi-tenant and personal-account option.
-2. Enable **Allow public client flows** and add the delegated Microsoft Graph **Files.ReadWrite** permission.
-3. Enter the registration's **Application (client) ID** in Pipopu and use the code to sign in at Microsoft. Pipopu keeps the session in memory, so sign in again after restarting Windows Pipopu.
+To use OneDrive when the local endpoint is unreachable, open **Settings** from the Windows tray menu and select **Sign in to OneDrive**. Copy the displayed code and complete Microsoft sign-in. Pipopu uses its built-in public client ID and delegated Microsoft Graph **Files.ReadWrite** permission. The sign-in session stays in memory, so sign in again after restarting Pipopu.
 
 Windows uses a temporary encrypted OneDrive item and sends its preauthenticated download URL over the secured BLE connection. When sending from Apple, Windows creates a preauthenticated upload session and shares its URL over BLE. Apple uploads in order and reports completion, then Windows retrieves and verifies the file before acknowledging it. Windows removes its temporary OneDrive items after the transfer when it can reach OneDrive.
+
+## Saving received files
+
+In **Settings** on Windows, enable **Save received files automatically** and choose a local folder or sign in and choose a OneDrive folder. Selecting a OneDrive folder saves a regular file in that account in addition to showing the received item in Pipopu.
+
+On iOS, turn on **Save received files automatically** under **Receiving**. Files and images appear in **Files → On My iPhone** (or **On My iPad**) **→ Pipopu → Received**. Text remains available to copy in Pipopu.
 
 ## Wire protocol
 
 Version 2 uses service UUID `EA259A40-8B6E-44DA-BEEC-E10D5680D630`. Windows exposes Apple writes with response (prefix `EA259A41`), Windows indications (`EA259A42`), and a readable discovery label (`EA259A43`). Version 1 clients use a separate service and cannot receive unpaired data from version 2.
 
 A packet travels as a start frame (opcode `01`, little-endian 32-bit token and length), data frames (opcode `02` followed by bytes), and an end frame (opcode `03` and token). The initial packets exchange P-256 public keys and random nonces. Both sides derive directional AES-GCM keys and a pairing code using HKDF-SHA256 over the agreement secret and the handshake transcript. Encrypted packets carry a monotonically increasing sequence number and protect transfer offers, approvals, route negotiation, and completion. Bulk payloads use a transfer-specific AES-GCM key with a separate nonce for each 256 KiB block.
+
+Within the v2 framing and encryption family, the first encrypted ready message advertises an inclusive minimum and maximum protocol version. The peers use the highest overlapping version and pin it for the connection. Packets with a conflicting version are rejected. Older v2 builds that omit the fields are treated as version 2. Bump the negotiated version for changes to the encrypted transfer messages. Assign a new service UUID if the framing or cryptographic handshake changes.
 
 ## Hardware smoke test
 
