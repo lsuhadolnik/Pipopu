@@ -10,6 +10,13 @@ Use a Windows 11 PC with a Bluetooth LE adapter that supports peripheral mode an
 dotnet run --project windows/Pipopu/Pipopu.csproj
 ```
 
+To build a portable 64-bit Windows executable, use the publish profile. Run
+`.build/publish/win-x64/Pipopu.exe` on the target PC without installing .NET.
+
+```powershell
+dotnet publish windows/Pipopu/Pipopu.csproj -c Release -p:PublishProfile=Windows-x64 -o .build/publish/win-x64
+```
+
 Closing the window keeps the app in the notification area. Click the tray icon to reopen it or right-click and choose **Exit** to stop advertising. On receipt, Pipopu opens a popup to copy text or an image, or save an image or file.
 
 To send, paste text or an image, or drop a single image or file. Select the iPhone or iPad below and click **Send**. Open Pipopu on the Apple device first and keep **Available to receive** enabled. The Apple app displays the received text or image and lets you save files through the Files picker.

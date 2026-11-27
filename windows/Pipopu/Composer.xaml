@@ -1,0 +1,115 @@
+<local:FlyoutWindow x:Class="Pipopu.Composer" x:ClassModifier="internal"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="clr-namespace:Pipopu"
+    Title="Pipopu" Height="454" Width="414" AllowDrop="True"
+    FontFamily="{DynamicResource BodyFont}" FontSize="14"
+    Foreground="{DynamicResource TextFillColorPrimaryBrush}">
+  <Grid Margin="24,14,24,20">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="*" />
+    </Grid.RowDefinitions>
+    <DockPanel LastChildFill="True">
+      <Button DockPanel.Dock="Right" Style="{DynamicResource CloseButton}" Click="CloseClick" />
+      <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+        <Image Source="{DynamicResource AppIcon}" Width="18" Height="18" Margin="0,0,8,0" />
+        <TextBlock Text="Pipopu" FontWeight="SemiBold" />
+      </StackPanel>
+    </DockPanel>
+
+    <Grid x:Name="ComposeView" Grid.Row="1" Margin="0,14,0,0">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="*" />
+        <RowDefinition Height="Auto" />
+      </Grid.RowDefinitions>
+      <StackPanel>
+        <TextBlock Style="{DynamicResource Heading}" Text="Send nearby" />
+        <StackPanel Orientation="Horizontal" Margin="0,5,0,0">
+          <TextBlock Text="&#xE702;" FontFamily="{DynamicResource SymbolFont}" FontSize="13"
+                     VerticalAlignment="Center" Margin="0,0,7,0"
+                     Foreground="{DynamicResource AccentTextFillColorPrimaryBrush}" />
+          <TextBlock x:Name="BluetoothStatus" Style="{DynamicResource SecondaryText}" VerticalAlignment="Center"
+                     Width="336" TextWrapping="Wrap" Text="Starting Bluetooth…" />
+        </StackPanel>
+      </StackPanel>
+
+      <StackPanel Grid.Row="1" Margin="0,19,0,0">
+        <Grid>
+          <TextBox x:Name="Message" Height="94" Padding="11,8" AcceptsReturn="True"
+                   TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
+                   AutomationProperties.Name="Message" TextChanged="RefreshSend" />
+          <TextBlock Text="Type or paste a message" IsHitTestVisible="False" Margin="12,9,0,0">
+            <TextBlock.Style>
+              <Style TargetType="TextBlock" BasedOn="{StaticResource SecondaryText}">
+                <Setter Property="Visibility" Value="Collapsed" />
+                <Style.Triggers>
+                  <DataTrigger Binding="{Binding Text, ElementName=Message}" Value="">
+                    <Setter Property="Visibility" Value="Visible" />
+                  </DataTrigger>
+                </Style.Triggers>
+              </Style>
+            </TextBlock.Style>
+          </TextBlock>
+        </Grid>
+        <StackPanel Orientation="Horizontal" Margin="-6,5,0,2">
+          <Button Style="{DynamicResource QuietButton}" Click="PasteClick" AutomationProperties.Name="Paste">
+            <StackPanel Orientation="Horizontal">
+              <TextBlock Text="&#xE77F;" FontFamily="{DynamicResource SymbolFont}" Margin="0,0,6,0" />
+              <TextBlock Text="Paste" />
+            </StackPanel>
+          </Button>
+          <Button Style="{DynamicResource QuietButton}" Click="BrowseClick" AutomationProperties.Name="Attach file">
+            <StackPanel Orientation="Horizontal">
+              <TextBlock Text="&#xE723;" FontFamily="{DynamicResource SymbolFont}" Margin="0,0,6,0" />
+              <TextBlock Text="Attach file" />
+            </StackPanel>
+          </Button>
+          <Button x:Name="ClearAttachment" Content="Remove attachment" Visibility="Collapsed"
+                  Style="{DynamicResource QuietButton}" Click="ClearClick" />
+        </StackPanel>
+        <TextBlock x:Name="AttachmentLabel" Style="{DynamicResource SecondaryText}" Margin="2,0,0,0"
+                   TextTrimming="CharacterEllipsis" Text="Drop an image or file up to 3 MB" />
+      </StackPanel>
+
+      <Grid Grid.Row="2" Margin="0,17,0,9">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto" />
+          <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <TextBlock Text="Nearby devices" FontWeight="SemiBold" />
+        <TextBlock x:Name="EmptyPeers" Grid.Row="1" Style="{DynamicResource SecondaryText}" Margin="0,6,0,0"
+                   Text="Open Pipopu on your iPhone or iPad to see it here." TextWrapping="Wrap" />
+        <ListBox x:Name="Peers" Grid.Row="1" Margin="-4,3,-4,0" Padding="0"
+                 Background="Transparent" BorderThickness="0" Visibility="Collapsed"
+                 AutomationProperties.Name="Nearby devices" SelectionChanged="RefreshSend">
+          <ListBox.ItemTemplate>
+            <DataTemplate>
+              <StackPanel Orientation="Horizontal" Margin="2,1">
+                <TextBlock Text="&#xE8EA;" FontFamily="{DynamicResource SymbolFont}" Margin="0,0,9,0" />
+                <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" />
+              </StackPanel>
+            </DataTemplate>
+          </ListBox.ItemTemplate>
+        </ListBox>
+      </Grid>
+
+      <DockPanel Grid.Row="3" LastChildFill="True">
+        <Button x:Name="SendButton" DockPanel.Dock="Right" Style="{DynamicResource AccentButtonStyle}"
+                FontWeight="SemiBold" MinWidth="98" MinHeight="36" AutomationProperties.Name="Send"
+                IsEnabled="False" Click="SendClick">
+          <StackPanel Orientation="Horizontal">
+            <TextBlock Text="&#xE724;" FontFamily="{DynamicResource SymbolFont}" Margin="0,0,7,0" />
+            <TextBlock Text="Send" />
+          </StackPanel>
+        </Button>
+        <TextBlock x:Name="Status" Style="{DynamicResource SecondaryText}" TextWrapping="Wrap"
+                   AutomationProperties.LiveSetting="Polite" Margin="0,0,12,0" VerticalAlignment="Center" />
+      </DockPanel>
+    </Grid>
+
+    <local:SendProgressView x:Name="SendView" Grid.Row="1" Visibility="Collapsed" />
+  </Grid>
+</local:FlyoutWindow>

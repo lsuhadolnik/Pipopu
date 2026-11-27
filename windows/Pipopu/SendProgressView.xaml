@@ -1,0 +1,21 @@
+<UserControl x:Class="Pipopu.SendProgressView" x:ClassModifier="internal"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="clr-namespace:Pipopu"
+    Foreground="{DynamicResource TextFillColorPrimaryBrush}">
+  <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,0,0,20">
+    <Grid Width="154" Height="154" HorizontalAlignment="Center" Margin="0,0,0,9">
+      <local:TransferArc Progress="1" Stroke="{DynamicResource ControlStrokeColorDefaultBrush}" StrokeThickness="6"
+                         StrokeStartLineCap="Round" StrokeEndLineCap="Round" />
+      <local:TransferArc x:Name="Gauge" Stroke="{DynamicResource AccentFillColorDefaultBrush}" StrokeThickness="6"
+                         StrokeStartLineCap="Round" StrokeEndLineCap="Round" />
+      <TextBlock x:Name="Glyph" Text="&#xE8EA;" FontFamily="{DynamicResource SymbolFont}" FontSize="40"
+                 HorizontalAlignment="Center" VerticalAlignment="Center" />
+    </Grid>
+    <TextBlock x:Name="HeadingText" Text="Sending" Style="{DynamicResource Heading}" TextAlignment="Center" />
+    <TextBlock x:Name="DeviceText" FontSize="15" FontWeight="SemiBold" Margin="0,5,0,0" MaxWidth="325"
+               TextTrimming="CharacterEllipsis" TextAlignment="Center" />
+    <TextBlock x:Name="Status" Style="{DynamicResource SecondaryText}" TextAlignment="Center" Margin="0,9,0,0"
+               AutomationProperties.LiveSetting="Polite" />
+  </StackPanel>
+</UserControl>
