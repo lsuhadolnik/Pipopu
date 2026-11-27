@@ -5,6 +5,9 @@ namespace Pipopu;
 
 internal static class Program
 {
+    internal static Icon AppIcon { get; } =
+        Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Information;
+
     [STAThread]
     private static void Main()
     {
@@ -35,7 +38,7 @@ internal sealed class TrayApp : ApplicationContext
         menu.Items.Add("Exit", null, (_, _) => ExitThread());
         tray = new NotifyIcon
         {
-            Icon = SystemIcons.Information,
+            Icon = Program.AppIcon,
             Text = "Pipopu",
             ContextMenuStrip = menu,
             Visible = true
@@ -106,7 +109,7 @@ internal sealed class Composer : Form
         StartPosition = FormStartPosition.CenterScreen;
         ClientSize = new Size(460, 480);
         MinimumSize = new Size(400, 440);
-        Icon = SystemIcons.Information;
+        Icon = Program.AppIcon;
 
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 1, RowCount = 9 };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -338,7 +341,7 @@ internal sealed class ReceivedPopup : Form
         ClientSize = new Size(400, 265);
         StartPosition = FormStartPosition.CenterScreen;
         TopMost = true;
-        Icon = SystemIcons.Information;
+        Icon = Program.AppIcon;
 
         var details = new TextBox
         {
@@ -384,7 +387,10 @@ internal sealed class ReceivedPopup : Form
             save.Click += (_, _) => Run(() =>
             {
                 string name = Path.GetFileName(transfer.Name.Replace('/', '\\'));
-                if (name is "" or "." or ".." || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+                var invalid = Path.GetInvalidFileNameChars();
+                name = new string(name.Select(character => invalid.Contains(character) ? '_' : character).ToArray())
+                    .TrimEnd(' ', '.');
+                if (name.Length == 0)
                     name = "Pipopu transfer";
                 using var picker = new SaveFileDialog { FileName = name };
                 if (picker.ShowDialog(this) == DialogResult.OK)

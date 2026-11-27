@@ -35,38 +35,55 @@ private struct ShareView: View {
     let close: () -> Void
     @State private var transfer: Transfer?
     @State private var error: String?
+    @State private var selectedPeer: UUID?
+    @ScaledMetric(relativeTo: .body) private var tileWidth = 102.0
+
+    private let accent = Color(red: 0.48, green: 0.32, blue: 0.89)
 
     var body: some View {
         NavigationStack {
-            List {
-                if let transfer {
-                    Section("Sharing") {
-                        Text(transfer.kind == .text ? transfer.text : transfer.name)
-                            .lineLimit(3)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 26) {
+                    if let transfer {
+                        preview(transfer)
+                    } else if let error {
+                        Label(error, systemImage: "exclamationmark.circle")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ProgressView("Loading shared item…")
                     }
-                } else if let error {
-                    Text(error)
-                } else {
-                    ProgressView("Loading shared item…")
-                }
-                if let progress = bluetooth.progress {
-                    ProgressView("Sending over Bluetooth…", value: progress)
-                }
-                if let result = bluetooth.result { Text(result).foregroundStyle(.secondary) }
-                Section("Nearby Windows PCs") {
-                    if bluetooth.peers.isEmpty { Text(bluetooth.state).foregroundStyle(.secondary) }
-                    ForEach(bluetooth.peers) { peer in
-                        Button {
-                            if let transfer { bluetooth.send(transfer, to: peer.id) }
-                        } label: {
-                            Label(peer.name, systemImage: "desktopcomputer")
+
+                    VStack(alignment: .leading, spacing: 18) {
+                        Text("Nearby Windows PCs").font(.headline)
+                            .accessibilityAddTraits(.isHeader)
+                        if bluetooth.peers.isEmpty {
+                            Label(bluetooth.state, systemImage: "dot.radiowaves.left.and.right")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, minHeight: 100)
+                        } else {
+                            LazyVGrid(columns: [GridItem(.adaptive(minimum: tileWidth), spacing: 12)], spacing: 18) {
+                                ForEach(bluetooth.peers) { peer in peerButton(peer) }
+                            }
+                            .frame(maxWidth: bluetooth.peers.count < 3
+                                ? tileWidth * Double(bluetooth.peers.count) + 12 : .infinity)
+                            .frame(maxWidth: .infinity)
                         }
-                        .disabled(transfer == nil || bluetooth.progress != nil || bluetooth.sendCompleted)
+                        if let result = bluetooth.result, !bluetooth.sendCompleted {
+                            Label(result, systemImage: "exclamationmark.circle")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
+                .padding(22)
+                .frame(maxWidth: 560)
+                .frame(maxWidth: .infinity)
             }
+            .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("Pipopu")
             .navigationBarTitleDisplayMode(.inline)
+            .tint(accent)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(bluetooth.sendCompleted ? "Done" : "Cancel", action: close)
@@ -79,8 +96,97 @@ private struct ShareView: View {
         }
     }
 
+    private func preview(_ item: Transfer) -> some View {
+        HStack(spacing: 14) {
+            Image(systemName: previewSymbol(for: item.kind))
+                .font(.system(size: 19, weight: .semibold))
+                .foregroundStyle(accent)
+                .frame(width: 44, height: 44)
+                .background(accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 13))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(item.kind == .text ? item.text : item.name)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(2)
+                if item.kind != .text {
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(item.data.count), countStyle: .file))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 20))
+    }
+
+    private func previewSymbol(for kind: Transfer.Kind) -> String {
+        switch kind {
+        case .text: "text.alignleft"
+        case .image: "photo"
+        case .file: "doc"
+        }
+    }
+
+    private func peerButton(_ peer: Bluetooth.Peer) -> some View {
+        let isSelected = selectedPeer == peer.id
+        let progress = isSelected ? bluetooth.progress : nil
+        let delivered = isSelected && bluetooth.sendCompleted
+
+        return Button {
+            guard let transfer else { return }
+            selectedPeer = peer.id
+            bluetooth.send(transfer, to: peer.id)
+        } label: {
+            VStack(spacing: 8) {
+                ZStack {
+                    Circle()
+                        .fill(LinearGradient(
+                            colors: [accent.opacity(0.20), accent.opacity(0.07)],
+                            startPoint: .topLeading, endPoint: .bottomTrailing
+                        ))
+                        .overlay {
+                            Circle().strokeBorder(accent.opacity(0.14), lineWidth: 1)
+                        }
+                    if let progress {
+                        Circle()
+                            .trim(from: 0, to: progress)
+                            .stroke(accent, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                            .rotationEffect(.degrees(-90))
+                            .padding(2)
+                            .animation(.linear(duration: 0.12), value: progress)
+                        Text(progress, format: .percent.precision(.fractionLength(0)))
+                            .font(.caption.weight(.semibold).monospacedDigit())
+                    } else {
+                        Image(systemName: delivered ? "checkmark" : "desktopcomputer")
+                            .font(.system(size: 25, weight: .medium))
+                    }
+                }
+                .frame(width: 70, height: 70)
+                .foregroundStyle(accent)
+                .accessibilityHidden(true)
+
+                Text(peer.name)
+                    .font(.caption.weight(.semibold))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2, reservesSpace: true)
+                    .foregroundStyle(.primary)
+                if delivered {
+                    Text("Sent").font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(transfer == nil || bluetooth.progress != nil || bluetooth.sendCompleted)
+        .accessibilityLabel("Send to " + peer.name)
+        .accessibilityValue(progress?.formatted(.percent.precision(.fractionLength(0))) ?? (delivered ? "Sent" : ""))
+    }
+
     private func loadTransfer() async throws -> Transfer {
-        for provider in items.flatMap({ $0.attachments ?? [] }) {
+        let providers = items.flatMap { $0.attachments ?? [] }
+        for provider in providers {
             if let identifier = provider.registeredTypeIdentifiers.first(where: {
                 UTType($0)?.conforms(to: .image) == true
             }) {
@@ -94,6 +200,7 @@ private struct ShareView: View {
                 }
             }
         }
+        if let file = try await SharedFile.load(from: providers) { return file }
         return try await SharedText.load(from: items)
     }
 
