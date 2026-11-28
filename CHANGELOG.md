@@ -1,3 +1,7 @@
+# Pipopu 0.4.2
+
+- Use GitHub Releases when the Windows updater cannot reach the Pipopu website over HTTPS.
+
 # Pipopu 0.4.1
 
 - Close the staged executable before Windows applies an update in place.

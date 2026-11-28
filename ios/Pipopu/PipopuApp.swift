@@ -752,7 +752,7 @@ private struct LargeFileExporter: UIViewControllerRepresentable {
 }
 
 private struct SetupView: View {
-    static let downloadURL = URL(string: "https://pipopu.solutions.si/#availability")!
+    static let downloadURL = URL(string: "https://github.com/lsuhadolnik/Pipopu/releases/latest")!
 
     let tint: Color
     let finish: () -> Void

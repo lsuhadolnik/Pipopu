@@ -64,6 +64,30 @@ jobs:
         with:
           path: site
 
+  release:
+    needs: windows-download
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-download
+          path: release
+      - name: Publish the Windows download on GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(jq -er '.version' release/update.json)
+          tag="v$version"
+          if assets=$(gh release view "$tag" --json assets --jq '[.assets[].name] | sort | join(" ")'); then
+            test "$assets" = 'Pipopu.exe update.json'
+          else
+            gh release create "$tag" release/download/Pipopu.exe release/update.json \
+              --target "$GITHUB_SHA" --title "Pipopu $version" --notes-file CHANGELOG.md --latest
+          fi
+
   deploy:
     needs: package
     runs-on: ubuntu-latest
