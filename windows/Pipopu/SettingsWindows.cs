@@ -8,28 +8,6 @@ namespace Pipopu;
 
 internal static class SettingsWindows
 {
-    internal static void ShowOneDriveSetup(Action markSeen, Action openSettings)
-    {
-        var (window, body) = CreateWindow("Welcome to Pipopu", 430);
-        window.ShowInTaskbar = false;
-        var heading = Section("Send large files with OneDrive");
-        heading.FontSize = 22;
-        body.Children.Add(heading);
-        body.Children.Add(new TextBlock
-        {
-            Text = "Use OneDrive to transfer encrypted files when your devices are on different networks. You can also save received files to a OneDrive folder.",
-            TextWrapping = TextWrapping.Wrap,
-            Margin = new Thickness(0, 4, 0, 12)
-        });
-        var actions = Actions(body);
-        var setup = AddButton(actions, "Set up OneDrive", () => { window.Close(); openSettings(); });
-        setup.SetResourceReference(Control.StyleProperty, "AccentButtonStyle");
-        AddButton(actions, "Maybe later", window.Close);
-        window.Closed += (_, _) => markSeen();
-        window.Show();
-        window.Activate();
-    }
-
     internal static async Task<bool> ConfirmAsync(Dispatcher dispatcher, string name, string code, CancellationToken cancellation)
     {
         var answer = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -64,7 +42,7 @@ internal static class SettingsWindows
         return await answer.Task;
     }
 
-    internal static Window Settings(SettingsStore store, BluetoothServer server)
+    internal static Window Settings(SettingsStore store, BluetoothServer server, Action openSetup)
     {
         var (window, body) = CreateWindow("Pipopu Settings", 490);
         var service = server.Cloud;
@@ -113,7 +91,10 @@ internal static class SettingsWindows
         var cloudFolder = AddButton(folderActions, "Choose OneDrive folder…", null);
         body.Children.Add(locationStatus);
         AddTrustedDevices(window, body, server);
-        var logs = AddButton(body, "Open transfer logs", () =>
+        var appActions = Actions(body);
+        appActions.Margin = new Thickness(0, 14, 0, 0);
+        AddButton(appActions, "Setup wizard…", openSetup);
+        AddButton(appActions, "Open transfer logs", () =>
         {
             try
             {
@@ -122,7 +103,6 @@ internal static class SettingsWindows
             }
             catch (Exception error) { MessageBox.Show(window, error.Message, "Pipopu"); }
         });
-        logs.Margin = new Thickness(0, 14, 0, 0);
         var assembly = typeof(SettingsWindows).Assembly;
         string? version = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
             .InformationalVersion.Split('+', 2)[0] ?? assembly.GetName().Version?.ToString(3);

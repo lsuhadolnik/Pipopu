@@ -14,11 +14,11 @@ internal sealed class SettingsStore
 {
     private const string RegistryPath = @"Software\Pipopu";
     private const string Value = "ReceivedFileSettings";
-    private const string SetupSeen = "OneDriveSetupSeen";
+    private const string SetupSeen = "DesktopSetupWizardSeen";
 
     internal ReceivedFileSettings Current { get; private set; } = Load();
 
-    internal bool HasSeenOneDriveSetup()
+    internal bool HasSeenSetupWizard()
     {
         try
         {
@@ -32,7 +32,7 @@ internal sealed class SettingsStore
         }
     }
 
-    internal void MarkOneDriveSetupSeen()
+    internal void MarkSetupWizardSeen()
     {
         try
         {

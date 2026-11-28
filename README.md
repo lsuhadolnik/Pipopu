@@ -19,6 +19,8 @@ dotnet publish windows/Pipopu/Pipopu.csproj -c Release -p:PublishProfile=Windows
 
 Closing the window keeps the app in the notification area. Click the tray icon to reopen it or right-click and choose **Exit** to stop advertising. On receipt, Pipopu opens a popup to copy text or an image, or save an image or file.
 
+The Windows setup wizard offers optional OneDrive setup, launch at Windows sign-in, and a move to `%LOCALAPPDATA%\Pipopu\App\Pipopu.exe` for the single-file download. Moving Pipopu restarts it from the new location and removes the original copy after the handoff. Launch at sign-in opens Pipopu in the tray. You can revisit these choices under **Settings → Setup wizard**.
+
 Click the name next to the Bluetooth icon to change how this device appears to nearby Apple devices. On iPhone or iPad, edit **Device name** in Settings in Pipopu to update how the device appears in the tray app. Open device lists refresh while connected.
 
 To send, paste text or an image, or drop a single image or file. Select the iPhone or iPad below and click **Send**. Use **Cancel** while data is sending to stop the transfer and keep your draft. Open Pipopu on the Apple device first and keep **Available to receive** enabled. The Apple app displays the received text or image and lets you save files through the Files picker.

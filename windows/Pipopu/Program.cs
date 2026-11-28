@@ -9,12 +9,23 @@ internal static class Program
     internal const string IconResource = "pack://application:,,,/Pipopu;component/Pipopu.ico";
 
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
-        using var instance = new Mutex(true, "Local\\Pipopu.Tray", out bool firstInstance);
-        if (!firstInstance)
-            return;
+        bool finishingMove = AppPlacement.IsMoveRestart(args);
+        using var instance = new Mutex(false, "Local\\Pipopu.Tray");
+        try
+        {
+            if (!instance.WaitOne(finishingMove ? TimeSpan.FromSeconds(30) : TimeSpan.Zero))
+                return;
+        }
+        catch (AbandonedMutexException) { }
 
+        try { Run(args, finishingMove); }
+        finally { instance.ReleaseMutex(); }
+    }
+
+    private static void Run(string[] args, bool finishingMove)
+    {
         TransferLog.Write("Pipopu started");
         ApplicationConfiguration.Initialize();
         AppContext.SetSwitch("Switch.System.Windows.Appearance.DisableFluentThemeWindowBackdrop", true);
@@ -29,8 +40,21 @@ internal static class Program
         });
 
         using var tray = new TrayApp(app);
-        tray.ShowComposer();
-        tray.ShowFirstRunSetup();
+        if (finishingMove)
+        {
+            var move = AppPlacement.FinishMove(args[1]);
+            tray.ShowComposer();
+            if (move.OpenOneDrive)
+                tray.ShowSettings();
+            if (move.CopyLeftBehind)
+                MessageBox.Show("Pipopu is running from Local AppData. The original copy could not be removed.",
+                    "Pipopu", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        else if (!args.Contains(AppPlacement.StartupArgument, StringComparer.Ordinal))
+        {
+            if (!tray.ShowFirstRunSetup())
+                tray.ShowComposer();
+        }
         app.Run();
     }
 }
@@ -57,6 +81,7 @@ internal sealed class TrayApp : IDisposable
     private string? displayedIncoming;
     private Window? settingsWindow;
     private Window? cloudWindow;
+    private SetupWizard? setupWizard;
 
     internal TrayApp(Application app)
     {
@@ -67,12 +92,7 @@ internal sealed class TrayApp : IDisposable
         menu.Items.Add("Open Pipopu", null, (_, _) => ShowComposer());
         menu.Items.Add("Settings…", null, (_, _) => ShowSettings());
         menu.Items.Add("Cloud transfers…", null, (_, _) => ShowCloudTransfers());
-        menu.Items.Add("Exit", null, (_, _) =>
-        {
-            exiting = true;
-            composer.PermitClose();
-            app.Shutdown();
-        });
+        menu.Items.Add("Exit", null, (_, _) => Exit());
         tray = new Forms.NotifyIcon
         {
             Icon = appIcon,
@@ -181,24 +201,87 @@ internal sealed class TrayApp : IDisposable
         composer.Present();
     }
 
-    internal void ShowFirstRunSetup()
+    internal bool ShowFirstRunSetup()
     {
-        if (settings.HasSeenOneDriveSetup())
-            return;
-        SettingsWindows.ShowOneDriveSetup(settings.MarkOneDriveSetupSeen, ShowSettings);
+        if (settings.HasSeenSetupWizard())
+            return false;
+        ShowSetupWizard(openComposerOnClose: true);
+        return true;
     }
 
-    private void ShowSettings()
+    private void ShowSetupWizard(bool openComposerOnClose = false)
+    {
+        if (setupWizard is not null)
+        {
+            setupWizard.Activate();
+            return;
+        }
+
+        bool openOneDrive = false;
+        string? startup = AppPlacement.StartupCommand();
+        var wizard = new SetupWizard(AppPlacement.CanMove, AppPlacement.IsInstalled, startup is not null, choices =>
+        {
+            string target = choices.Move ? AppPlacement.InstalledExe : AppPlacement.CurrentExe;
+            string? desiredStartup = choices.StartAtSignIn ? AppPlacement.StartupCommandFor(target) : null;
+            string? previousStartup = AppPlacement.StartupCommand();
+            bool startupChanged = !string.Equals(previousStartup, desiredStartup, StringComparison.Ordinal);
+            if (choices.Move)
+                AppPlacement.PrepareMove();
+            if (startupChanged)
+                AppPlacement.SetStartupCommand(desiredStartup);
+            try
+            {
+                if (choices.Move)
+                    AppPlacement.RestartInstalled(choices.OpenOneDrive);
+            }
+            catch
+            {
+                if (startupChanged)
+                    AppPlacement.SetStartupCommand(previousStartup);
+                throw;
+            }
+            if (choices.Move)
+            {
+                settings.MarkSetupWizardSeen();
+                Exit();
+            }
+            else
+                openOneDrive = choices.OpenOneDrive;
+        });
+        setupWizard = wizard;
+        wizard.Closed += (_, _) =>
+        {
+            setupWizard = null;
+            if (exiting)
+                return;
+            settings.MarkSetupWizardSeen();
+            if (openComposerOnClose)
+                ShowComposer();
+            if (wizard.Completed && openOneDrive)
+                ShowSettings();
+        };
+        wizard.Show();
+        wizard.Activate();
+    }
+
+    internal void ShowSettings()
     {
         if (settingsWindow is null)
         {
-            settingsWindow = SettingsWindows.Settings(settings, server);
+            settingsWindow = SettingsWindows.Settings(settings, server, () => ShowSetupWizard());
             settingsWindow.Closed += (_, _) => settingsWindow = null;
             settingsWindow.Show();
         }
         if (settingsWindow.WindowState == WindowState.Minimized)
             settingsWindow.WindowState = WindowState.Normal;
         settingsWindow.Activate();
+    }
+
+    private void Exit()
+    {
+        exiting = true;
+        composer.PermitClose();
+        app.Shutdown();
     }
 
     private void ShowCloudTransfers()
