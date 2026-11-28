@@ -2,6 +2,16 @@
 
 Pipopu sends text, images, and files between an iPhone or iPad and the Pipopu desktop app. Bluetooth Low Energy handles discovery, pairing, and payloads up to 500 KB. Larger payloads use local Wi-Fi or an optional OneDrive fallback.
 
+## Project website
+
+The static website lives in [`site/`](site/). Preview it from the repository root with `python -m http.server 8000 --bind 127.0.0.1 --directory site`, then open [the local preview](http://127.0.0.1:8000/).
+
+In [GitHub Pages settings](https://github.com/lsuhadolnik/Pipopu/settings/pages), select **GitHub Actions** as the publishing source and set the custom domain to `pipopu.solutions.si`. The [Publish website workflow](.github/workflows/pages.yml) deploys changes to `site/` and the workflow itself on `main`. You can also run it manually from the Actions tab using `main`.
+
+The DNS CNAME for `pipopu.solutions.si` should point to `lsuhadolnik.github.io`. Once GitHub validates the domain and provisions a certificate, enable **Enforce HTTPS** in Pages settings. [GitHub custom domain documentation](https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site/managing-a-custom-domain-for-your-github-pages-site)
+
+For App Store Connect, use [Privacy Policy](https://pipopu.solutions.si/privacy/) as the Privacy Policy URL and [Support](https://pipopu.solutions.si/support/) as the Support URL.
+
 ## Run on Windows
 
 Use a device running Windows 11 with a Bluetooth LE adapter that supports peripheral mode and install the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
