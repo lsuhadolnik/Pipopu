@@ -2,6 +2,15 @@ import CryptoKit
 import Foundation
 import Security
 
+struct CloudNotice: Codable, Identifiable, Sendable {
+    let id: String
+    let peer: String
+    let name: String
+    let outgoing: Bool
+    let status: String
+    let error: String?
+}
+
 struct Wire: Codable {
     var type: String
     var id: String? = nil
@@ -17,12 +26,14 @@ struct Wire: Codable {
     var protocolMin: Int? = nil
     var protocolMax: Int? = nil
     var version: Int? = nil
+    var secure: Bool? = nil
 }
 
 enum WireProtocol {
     static let legacy = 2
     static let minimum = 2
-    static let current = 2
+    static let current = 3
+    static let cloudAndSecure = 3
 
     static func negotiate(_ minimum: Int?, _ maximum: Int?) -> Int? {
         if minimum == nil && maximum == nil {
@@ -174,13 +185,21 @@ private func bytes(_ value: UInt64) -> Data {
 final class TemporaryFile: @unchecked Sendable {
     let url: URL
     let size: Int64
+    private let owned: Bool
 
     init(size: Int64) {
         url = FileManager.default.temporaryDirectory.appendingPathComponent("pipopu-" + UUID().uuidString)
         self.size = size
+        owned = true
     }
 
-    deinit { try? FileManager.default.removeItem(at: url) }
+    init(url: URL, size: Int64) {
+        self.url = url
+        self.size = size
+        owned = false
+    }
+
+    deinit { if owned { try? FileManager.default.removeItem(at: url) } }
 }
 
 enum FileCipher {
@@ -206,7 +225,10 @@ enum FileCipher {
                 let encrypted = try readExact(input, count: count)
                 let tag = try readExact(input, count: 16)
                 let sealed = try AES.GCM.SealedBox(nonce: nonce, ciphertext: encrypted, tag: tag)
-                try output.write(contentsOf: AES.GCM.open(sealed, using: key))
+                do { try output.write(contentsOf: AES.GCM.open(sealed, using: key)) }
+                catch CryptoKitError.authenticationFailure {
+                    throw TransferError.message("The downloaded file failed its encryption integrity check.")
+                }
             }
             offset += Int64(count)
         }
@@ -218,7 +240,7 @@ enum FileCipher {
         var result = Data()
         while result.count < count {
             guard let chunk = try file.read(upToCount: count - result.count), !chunk.isEmpty else {
-                throw TransferError.invalid
+                throw TransferError.message("The file ended before all expected bytes arrived.")
             }
             result.append(chunk)
         }

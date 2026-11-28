@@ -58,12 +58,20 @@ enum BulkNetwork {
             request.httpMethod = "HEAD"
             if let (_, response) = try? await probe.data(for: request), status(response) == 200 { return url }
         }
-        throw TransferError.message("The PC could not be reached on the local network.")
+        throw TransferError.message("The receiving device could not be reached on the local network.")
     }
 
-    static func cloudURL(_ route: Wire) throws -> URL {
-        guard let location = route.urls?.first, let url = URL(string: location),
-              TransferRoutes.valid(url, cloud: true) else { throw TransferError.invalid }
+    static func cloudURL(_ route: Wire, forUpload: Bool = false) throws -> URL {
+        let purpose = forUpload ? "upload" : "download"
+        guard let location = route.urls?.first else {
+            throw TransferError.message("The other device did not provide a OneDrive \(purpose) link.")
+        }
+        guard let url = URL(string: location), url.host != nil else {
+            throw TransferError.message("The other device provided an incomplete OneDrive \(purpose) link.")
+        }
+        guard TransferRoutes.valid(url, cloud: true) else {
+            throw TransferError.message("Pipopu could not validate the OneDrive \(purpose) address (\(url.host ?? "unknown host")). Update Pipopu on both devices and try again.")
+        }
         return url
     }
 
@@ -72,9 +80,13 @@ enum BulkNetwork {
         defer { client.finishTasksAndInvalidate() }
         let (source, response) = try await client.download(from: url)
         defer { try? FileManager.default.removeItem(at: source) }
-        guard status(response) == 200,
-              let bytes = try FileManager.default.attributesOfItem(atPath: source.path)[.size] as? NSNumber,
-              bytes.int64Value == size else { throw TransferError.invalid }
+        guard status(response) == 200 else {
+            throw TransferError.message("The file download returned HTTP \(status(response)).")
+        }
+        guard let bytes = try FileManager.default.attributesOfItem(atPath: source.path)[.size] as? NSNumber,
+              bytes.int64Value == size else {
+            throw TransferError.message("The downloaded file size did not match the transfer offer.")
+        }
         let file = TemporaryFile(size: size)
         try FileManager.default.moveItem(at: source, to: file.url)
         return file
@@ -87,7 +99,9 @@ enum BulkNetwork {
         request.httpMethod = "PUT"
         request.setValue(String(file.size), forHTTPHeaderField: "Content-Length")
         let (_, response) = try await client.upload(for: request, fromFile: file.url)
-        guard status(response) == 204 else { throw TransferError.message("The PC did not accept the local upload.") }
+        guard status(response) == 204 else {
+            throw TransferError.message("The receiving device rejected the local upload (HTTP \(status(response))).")
+        }
     }
 
     static func uploadCloud(_ url: URL, file: TemporaryFile, progress: @escaping @MainActor (Double) -> Void) async throws {
@@ -109,10 +123,33 @@ enum BulkNetwork {
             let observer = TransferRoutes(cloud: true) { fraction in
                 progress((Double(start) + Double(count) * fraction) / Double(file.size))
             }
-            let (_, response) = try await client.upload(for: request, from: bytes, delegate: observer)
+            let response: URLResponse
+            do {
+                let (_, reply) = try await client.upload(for: request, from: bytes, delegate: observer)
+                response = reply
+            } catch let error as URLError where error.code != .cancelled {
+                let reason: String
+                switch error.code {
+                case .timedOut: reason = "OneDrive stopped responding."
+                case .notConnectedToInternet, .networkConnectionLost: reason = "The internet connection dropped during the OneDrive upload."
+                case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed: reason = "The iPhone or iPad could not reach OneDrive."
+                case .secureConnectionFailed, .serverCertificateUntrusted:
+                    reason = "The connection to OneDrive could not be authenticated."
+                default: reason = "The connection to OneDrive failed (network error \(error.errorCode))."
+                }
+                throw TransferError.message(reason)
+            }
             let code = status(response)
             guard end < file.size ? code == 202 : code == 200 || code == 201 else {
-                throw TransferError.message("OneDrive upload failed (\(code)).")
+                let reason: String
+                switch code {
+                case 401, 403: reason = "OneDrive refused access to this upload link."
+                case 404, 410: reason = "The OneDrive upload session is missing or has expired."
+                case 429: reason = "OneDrive is limiting upload requests. Try again shortly."
+                case 507: reason = "The receiving OneDrive account is out of storage."
+                default: reason = "OneDrive rejected part of the file."
+                }
+                throw TransferError.message("\(reason) (HTTP \(code))")
             }
             offset = end
             await progress(Double(offset) / Double(file.size))

@@ -7,7 +7,7 @@
     <key>CFBundleDisplayName</key><string>Send via Pipopu</string>
     <key>CFBundleSymbolName</key><string>paperplane</string>
     <key>NSBluetoothAlwaysUsageDescription</key>
-    <string>Pipopu uses Bluetooth to send shared text, images, and files to nearby Windows PCs.</string>
+    <string>Pipopu uses Bluetooth to send shared text, images, and files to nearby devices.</string>
     <key>NSExtension</key>
     <dict>
         <key>NSExtensionAttributes</key>

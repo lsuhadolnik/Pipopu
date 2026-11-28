@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Reflection;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Threading;
@@ -41,33 +42,17 @@ internal static class SettingsWindows
         return await answer.Task;
     }
 
-    internal static void Trusted(BluetoothServer server)
-    {
-        var (window, body) = CreateWindow("Trusted devices", 390);
-        var devices = new ListBox { Height = 180, DisplayMemberPath = "Value" };
-        body.Children.Add(devices);
-        void Refresh() => devices.ItemsSource = server.Trust.All().OrderBy(item => item.Value).ToArray();
-        Refresh();
-        AddButton(body, "Forget selected device", () =>
-        {
-            if (devices.SelectedItem is not KeyValuePair<string, string> peer)
-                return;
-            try { server.Forget(peer.Key); Refresh(); }
-            catch (Exception error) { MessageBox.Show(window, error.Message, "Pipopu"); }
-        });
-        window.Show();
-        window.Activate();
-    }
-
-    internal static Window Settings(SettingsStore store, OneDrive service)
+    internal static Window Settings(SettingsStore store, BluetoothServer server)
     {
         var (window, body) = CreateWindow("Pipopu Settings", 490);
+        var service = server.Cloud;
         var lifetime = new CancellationTokenSource();
         var cloudStatus = new TextBlock { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 6, 0, 4) };
         var location = new TextBlock { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 4, 0, 3) };
         var locationStatus = new TextBlock { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 6, 0, 0) };
         bool signingIn = false;
         Uri? signInPage = null;
+        string? signInCode = null;
 
         body.Children.Add(Section("OneDrive"));
         body.Children.Add(new TextBlock
@@ -79,6 +64,8 @@ internal static class SettingsWindows
         var accountActions = Actions(body);
         var signIn = AddButton(accountActions, "Sign in to OneDrive", null);
         var signOut = AddButton(accountActions, "Sign out", null);
+        var copyCode = AddButton(accountActions, "Copy code", () => TryCopyCode());
+        copyCode.Visibility = Visibility.Collapsed;
         var open = AddButton(body, "Open Microsoft sign-in", () =>
         {
             if (signInPage is not null)
@@ -103,6 +90,20 @@ internal static class SettingsWindows
         var localFolder = AddButton(folderActions, "Choose local folder…", null);
         var cloudFolder = AddButton(folderActions, "Choose OneDrive folder…", null);
         body.Children.Add(locationStatus);
+        AddTrustedDevices(window, body, server);
+        var assembly = typeof(SettingsWindows).Assembly;
+        string? version = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
+            .InformationalVersion.Split('+', 2)[0] ?? assembly.GetName().Version?.ToString(3);
+        if (version is not null)
+        {
+            var versionText = new TextBlock
+            {
+                Text = $"Version {version}", Margin = new Thickness(0, 20, 0, 0),
+                HorizontalAlignment = HorizontalAlignment.Right
+            };
+            versionText.SetResourceReference(TextBlock.ForegroundProperty, "TextFillColorSecondaryBrush");
+            body.Children.Add(versionText);
+        }
         cloudStatus.Text = service.IsSignedIn ? "Signed in to OneDrive." : "Sign in when you want to use OneDrive.";
         Refresh();
 
@@ -130,8 +131,10 @@ internal static class SettingsWindows
                 await service.SignInAsync((code, uri) =>
                 {
                     signInPage = uri;
-                    cloudStatus.Text = $"Enter code {code} on the Microsoft sign-in page.";
+                    signInCode = code;
+                    copyCode.Visibility = Visibility.Visible;
                     open.Visibility = Visibility.Visible;
+                    TryCopyCode();
                 }, lifetime.Token);
                 cloudStatus.Text = "Signed in to OneDrive.";
             }
@@ -139,8 +142,10 @@ internal static class SettingsWindows
             finally
             {
                 signInPage = null;
+                signInCode = null;
                 signingIn = false;
                 open.Visibility = Visibility.Collapsed;
+                copyCode.Visibility = Visibility.Collapsed;
                 Refresh();
             }
         };
@@ -152,6 +157,21 @@ internal static class SettingsWindows
         };
         window.Closed += (_, _) => lifetime.Cancel();
         return window;
+
+        void TryCopyCode()
+        {
+            if (signInCode is not { } code)
+                return;
+            try
+            {
+                Clipboard.SetText(code);
+                cloudStatus.Text = $"Code {code} copied. Paste it on the Microsoft sign-in page.";
+            }
+            catch (System.Runtime.InteropServices.ExternalException)
+            {
+                cloudStatus.Text = $"Enter code {code} on the Microsoft sign-in page, or try Copy code again.";
+            }
+        }
 
         void Apply(ReceivedFileSettings next)
         {
@@ -176,6 +196,42 @@ internal static class SettingsWindows
                 locationStatus.Text = current.CloudFolder is not null && !service.IsSignedIn
                     ? "Sign in to use the selected OneDrive folder." : "";
         }
+    }
+
+    private static void AddTrustedDevices(Window window, Panel body, BluetoothServer server)
+    {
+        var heading = Section("Trusted devices");
+        heading.Margin = new Thickness(0, 22, 0, 8);
+        body.Children.Add(heading);
+        var empty = new TextBlock { Text = "No trusted devices yet." };
+        body.Children.Add(empty);
+        var devices = new ListBox { MaxHeight = 140, DisplayMemberPath = "Value", SelectedValuePath = "Key" };
+        System.Windows.Automation.AutomationProperties.SetName(devices, "Trusted devices");
+        body.Children.Add(devices);
+        var forget = AddButton(body, "Forget selected device", () =>
+        {
+            if (devices.SelectedValue is not string identity)
+                return;
+            try { server.Forget(identity); }
+            catch (Exception error) { MessageBox.Show(window, error.Message, "Pipopu"); }
+        });
+        devices.SelectionChanged += (_, _) => forget.IsEnabled = devices.SelectedValue is not null;
+
+        void Refresh()
+        {
+            var selection = devices.SelectedValue;
+            var peers = server.Trust.All().OrderBy(peer => peer.Value).ToArray();
+            devices.ItemsSource = peers;
+            devices.SelectedValue = selection;
+            devices.Visibility = forget.Visibility = peers.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
+            empty.Visibility = peers.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+            forget.IsEnabled = devices.SelectedValue is not null;
+        }
+
+        void OnChange() => window.Dispatcher.BeginInvoke(Refresh);
+        server.Trust.Changed += OnChange;
+        window.Closed += (_, _) => server.Trust.Changed -= OnChange;
+        Refresh();
     }
 
     private static OneDriveFolder? ChooseOneDriveFolder(Window owner, OneDrive service)
@@ -288,6 +344,97 @@ internal static class SettingsWindows
         parent.Children.Add(actions);
         return actions;
     }
+    internal static KeyValuePair<string, string>? ChooseCloudRecipient(Window owner, TrustStore trust)
+    {
+        var (window, body) = CreateWindow("Send over cloud", 390);
+        window.Owner = owner;
+        window.WindowStartupLocation = WindowStartupLocation.CenterOwner;
+        body.Children.Add(new TextBlock { Text = "Choose a trusted device." });
+        var peers = new ListBox
+        {
+            Height = 150, DisplayMemberPath = "Value", Margin = new Thickness(0, 8, 0, 0),
+            ItemsSource = trust.All().OrderBy(peer => peer.Value).ToArray()
+        };
+        body.Children.Add(peers);
+        var send = AddButton(Actions(body), "Queue transfer", () => window.DialogResult = true);
+        send.IsEnabled = false;
+        peers.SelectionChanged += (_, _) => send.IsEnabled = peers.SelectedItem is KeyValuePair<string, string>;
+        return window.ShowDialog() == true && peers.SelectedItem is KeyValuePair<string, string> peer ? peer : null;
+    }
+
+    internal static Window CloudStatus(CloudTransfers queue, OneDrive oneDrive, Func<Task> refreshCloud,
+        Action<Transfer> openReceived)
+    {
+        var (window, body) = CreateWindow("Pipopu Cloud transfers", 550);
+        body.Children.Add(new TextBlock
+        {
+            Text = "Queued transfers continue on OneDrive. Check here after reopening Pipopu.",
+            TextWrapping = TextWrapping.Wrap
+        });
+        var list = new ListBox
+        {
+            Height = 230, DisplayMemberPath = nameof(CloudSummary.Caption), Margin = new Thickness(0, 10, 0, 5)
+        };
+        var status = new TextBlock { TextWrapping = TextWrapping.Wrap };
+        body.Children.Add(list);
+        body.Children.Add(status);
+        var actions = Actions(body);
+        var refresh = AddButton(actions, "Check now", null);
+        var open = AddButton(actions, "Open received file", null);
+        var retry = AddButton(actions, "Retry upload", null);
+        var lifetime = new CancellationTokenSource();
+        bool closed = false;
+
+        void Refresh()
+        {
+            if (closed)
+                return;
+            string? selected = (list.SelectedItem as CloudSummary)?.Id;
+            var jobs = queue.List();
+            list.ItemsSource = jobs;
+            list.SelectedItem = jobs.FirstOrDefault(job => job.Id == selected);
+            status.Text = !oneDrive.IsSignedIn ? "Sign in to OneDrive in Settings to resume cloud transfers." :
+                jobs.Length == 0 ? "No cloud transfers yet." : "";
+        }
+
+        void OnChange() => window.Dispatcher.BeginInvoke(Refresh);
+        queue.Changed += OnChange;
+        window.Closed += (_, _) =>
+        {
+            closed = true;
+            queue.Changed -= OnChange;
+            lifetime.Cancel();
+        };
+        refresh.Click += async (_, _) =>
+        {
+            await refreshCloud();
+            Refresh();
+        };
+        retry.Click += async (_, _) =>
+        {
+            if (list.SelectedItem is not CloudSummary { Outgoing: true, Status: CloudTransfers.Failed } job)
+                return;
+            queue.Retry(job.Id);
+            await refreshCloud();
+            Refresh();
+        };
+        open.Click += async (_, _) =>
+        {
+            if (list.SelectedItem is not CloudSummary { Outgoing: false, Status: CloudTransfers.Received } job)
+                return;
+            try { openReceived(await queue.OpenReceivedAsync(job.Id, lifetime.Token)); }
+            catch (Exception error) { status.Text = error.Message; }
+        };
+        list.SelectionChanged += (_, _) =>
+        {
+            open.IsEnabled = list.SelectedItem is CloudSummary { Outgoing: false, Status: CloudTransfers.Received };
+            retry.IsEnabled = list.SelectedItem is CloudSummary { Outgoing: true, Status: CloudTransfers.Failed };
+        };
+        open.IsEnabled = retry.IsEnabled = false;
+        Refresh();
+        return window;
+    }
+
     private static (Window, StackPanel) CreateWindow(string title, double width)
     {
         var layout = new StackPanel { Margin = new Thickness(20) };

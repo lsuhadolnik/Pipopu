@@ -9,13 +9,14 @@ namespace Pipopu;
 internal sealed record Wire(
     string Type, string? Id = null, string? Name = null, int Kind = 0, long Size = 0,
     bool Pair = false, byte[]? Data = null, string[]? Urls = null, string? Route = null, string? Error = null,
-    bool Receive = false, int? ProtocolMin = null, int? ProtocolMax = null, int? Version = null);
+    bool Receive = false, int? ProtocolMin = null, int? ProtocolMax = null, int? Version = null, bool Secure = false);
 
 internal static class WireProtocol
 {
     internal const int Legacy = 2;
     internal const int Minimum = 2;
-    internal const int Current = 2;
+    internal const int Current = 3;
+    internal const int CloudAndSecure = 3;
 
     internal static int? Negotiate(int? minimum, int? maximum)
     {
@@ -86,6 +87,7 @@ internal sealed class TrustStore
 
     internal bool Contains(string id) { lock (gate) return trusted.ContainsKey(id); }
     internal KeyValuePair<string, string>[] All() { lock (gate) return trusted.ToArray(); }
+    internal event Action? Changed;
 
     internal void Remember(string id, string name)
     {
@@ -95,6 +97,7 @@ internal sealed class TrustStore
             Save(trustFile, JsonSerializer.SerializeToUtf8Bytes(updated));
             trusted[id] = name;
         }
+        Changed?.Invoke();
     }
 
     internal void Forget(string id)
@@ -106,6 +109,7 @@ internal sealed class TrustStore
             Save(trustFile, JsonSerializer.SerializeToUtf8Bytes(updated));
             trusted.Remove(id);
         }
+        Changed?.Invoke();
     }
 
     private static void Save(string path, byte[] bytes)

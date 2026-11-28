@@ -6,7 +6,7 @@ namespace Pipopu;
 
 internal enum TransferKind : byte { Text = 1, Image, File }
 
-internal sealed record Transfer(TransferKind Kind, string Name, byte[] Data, TransferFile? File = null)
+internal sealed record Transfer(TransferKind Kind, string Name, byte[] Data, TransferFile? File = null, bool Secure = false)
 {
     internal const int Limit = 500_000;
     internal const int TextLimit = 3_000_000;
@@ -22,7 +22,8 @@ internal sealed record Transfer(TransferKind Kind, string Name, byte[] Data, Tra
         if (offer.Id is null || !Guid.TryParseExact(offer.Id, "N", out _) ||
             offer.Name is null || Encoding.UTF8.GetByteCount(offer.Name) > 255 ||
             offer.Kind is < 1 or > 3 || offer.Size < 0 || offer.Size > FileLimit ||
-            (offer.Kind == (int)TransferKind.Text && offer.Size > TextLimit))
+            (offer.Kind == (int)TransferKind.Text && offer.Size > TextLimit) ||
+            (offer.Secure && (offer.Kind != (int)TransferKind.Text || offer.Size > Limit || offer.Route is not null)))
             throw new InvalidDataException("Invalid file offer.");
     }
 }

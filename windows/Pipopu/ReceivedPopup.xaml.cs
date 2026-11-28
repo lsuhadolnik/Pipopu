@@ -19,11 +19,13 @@ internal partial class ReceivedPopup : FlyoutWindow
 
         HeadingText.Text = transfer.Kind switch
         {
+            TransferKind.Text when transfer.Secure => "Secure text received",
             TransferKind.Text => "Text received",
             TransferKind.Image => "Image received",
             _ => "File received"
         };
-        Details.Text = transfer.Kind == TransferKind.Text ? transfer.Text : transfer.Name;
+        Details.Text = transfer.Secure ? "Use Copy secure text to put it on your clipboard." :
+            transfer.Kind == TransferKind.Text ? transfer.Text : transfer.Name;
         if (transfer.Kind == TransferKind.Image)
         {
             try
@@ -45,7 +47,7 @@ internal partial class ReceivedPopup : FlyoutWindow
             }
         }
 
-        CopyText.Text = image is null ? "Copy text" : "Copy image";
+        CopyText.Text = transfer.Secure ? "Copy secure text" : image is null ? "Copy text" : "Copy image";
         AutomationProperties.SetName(CopyButton, CopyText.Text);
         if (image is null)
             Height = 248;

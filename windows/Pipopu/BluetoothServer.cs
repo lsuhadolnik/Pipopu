@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -21,7 +22,7 @@ internal sealed class BluetoothServer : IDisposable
     private const string DeviceNameValue = "DeviceName";
     private const int MaxDeviceNameBytes = 64;
 
-    internal sealed record Peer(string Id, string Name)
+    internal sealed record Peer(string Id, string Name, int Version)
     {
         public override string ToString() => Name;
     }
@@ -34,6 +35,7 @@ internal sealed class BluetoothServer : IDisposable
         internal string Name = "";
         internal bool Receives;
         internal int? Version;
+        internal bool RemoteTrust;
         internal Transaction? Active;
     }
 
@@ -62,6 +64,14 @@ internal sealed class BluetoothServer : IDisposable
     private readonly Dictionary<string, Link> links = new();
     internal TrustStore Trust { get; } = new();
     internal OneDrive Cloud { get; } = new();
+    internal CloudTransfers Deferred { get; }
+
+    internal BluetoothServer()
+    {
+        Deferred = new CloudTransfers(Cloud);
+        Deferred.Arrival += transfer => TransferReceived?.Invoke(transfer);
+        Deferred.Progress += progress => IncomingTransferProgress?.Invoke(progress);
+    }
     internal Func<string, string, CancellationToken, Task<bool>>? ConfirmTrust { get; set; }
     internal event Action<string?>? PairingCodeChanged;
 
@@ -73,6 +83,7 @@ internal sealed class BluetoothServer : IDisposable
     private bool disposed;
 
     internal event Action<Transfer>? TransferReceived;
+    internal event Action<TransferProgress>? IncomingTransferProgress;
     internal event Action? PeersChanged;
     internal event Action<string>? StatusChanged;
 
@@ -182,7 +193,8 @@ internal sealed class BluetoothServer : IDisposable
     {
         lock (gate)
             return links.Where(entry => entry.Value.Receives)
-                .Select(entry => new Peer(entry.Key, entry.Value.Name)).OrderBy(peer => peer.Name).ToArray();
+                .Select(entry => new Peer(entry.Key, entry.Value.Name, entry.Value.Version ?? WireProtocol.Legacy))
+                .OrderBy(peer => peer.Name).ToArray();
     }
 
     internal void Forget(string identity)
@@ -193,7 +205,8 @@ internal sealed class BluetoothServer : IDisposable
                 link.Active?.Lifetime.Cancel();
     }
 
-    internal async Task SendAsync(Peer peer, Transfer transfer, IProgress<int> progress, CancellationToken cancellation)
+    internal async Task SendAsync(Peer peer, Transfer transfer, IProgress<int> progress, CancellationToken cancellation,
+        bool overCloud = false, IProgress<TransferProgress>? networkProgress = null)
     {
         using var transaction = new Transaction(Guid.NewGuid().ToString("N"), cancellation);
         Link link;
@@ -201,6 +214,10 @@ internal sealed class BluetoothServer : IDisposable
         {
             if (!links.TryGetValue(peer.Id, out link!) || !link.Receives || link.Active is not null)
                 throw new IOException("The selected device is disconnected or busy.");
+            if ((transfer.Secure || overCloud) && link.Version < WireProtocol.CloudAndSecure)
+                throw new IOException("Update Pipopu on the other device to use secure text or queued cloud sending.");
+            if (overCloud && !Cloud.IsSignedIn)
+                throw new IOException("Sign in to OneDrive in Pipopu Settings before sending over cloud.");
             link.Active = transaction;
         }
 
@@ -210,21 +227,32 @@ internal sealed class BluetoothServer : IDisposable
         bool pair = !Trust.Contains(link.Session.Identity);
         try
         {
-            var offer = new Wire("offer", id, transfer.Name, (int)transfer.Kind, transfer.Size, pair);
+            var offer = new Wire("offer", id, transfer.Name, (int)transfer.Kind, transfer.Size, pair,
+                Route: overCloud ? "cloud-deferred" : null, Secure: transfer.Secure);
             Transfer.Validate(offer);
-            await SendPacketAsync(link, offer, token);
-            var review = await transaction.NextAsync(PairingTimeout);
-            Require(review, "review");
-            if (pair || review.Pair)
+            if (!overCloud || pair || !link.RemoteTrust)
             {
-                PairingCodeChanged?.Invoke(link.Session.Code);
-                await EnsureTrustConfirmedAsync(link, token);
+                await SendPacketAsync(link, offer, token);
+                var review = await transaction.NextAsync(PairingTimeout);
+                Require(review, "review");
+                if (pair || review.Pair)
+                {
+                    PairingCodeChanged?.Invoke(link.Session.Code);
+                    await EnsureTrustConfirmedAsync(link, token);
+                }
+                Require(await transaction.NextAsync(PairingTimeout), "accept");
+                PairingCodeChanged?.Invoke(null);
+                await SendPacketAsync(link, new Wire("verified", id), token);
+                if (pair || review.Pair)
+                    Trust.Remember(link.Session.Identity, link.Name);
             }
-            Require(await transaction.NextAsync(PairingTimeout), "accept");
-            PairingCodeChanged?.Invoke(null);
-            await SendPacketAsync(link, new Wire("verified", id), token);
-            if (pair || review.Pair)
-                Trust.Remember(link.Session.Identity, link.Name);
+
+            if (overCloud)
+            {
+                Release(link, transaction);
+                await Deferred.EnqueueAsync(id, link.Session.Identity, link.Name, transfer, cancellation);
+                return;
+            }
 
             if (transfer.Size <= Transfer.Limit)
             {
@@ -238,21 +266,31 @@ internal sealed class BluetoothServer : IDisposable
             }
             else
             {
+                var network = new TransferProgressReporter(id, transfer.Name, FileCipher.EncryptedSize(transfer.Size),
+                    value => networkProgress?.Report(value));
+                network.Update("Encrypting file…");
                 await using var input = transfer.OpenRead();
                 using var encrypted = await FileCipher.TransformAsync(input, transfer.Size, link.Session.FileKey(id), true, token);
-                if (!await TryLanAsync(link, transaction, encrypted, upload: false, progress))
+                network.Update("Checking local network…");
+                if (!await TryLanAsync(link, transaction, encrypted, upload: false, progress,
+                    bytes => network.Update("Sending over local network", bytes)))
                 {
                     Uri? session = null;
                     try
                     {
+                        network.Update("Acquiring OneDrive upload link…");
                         session = await Cloud.CreateUploadAsync(id, token);
-                        await Cloud.UploadAsync(session, encrypted, token, progress);
+                        const string uploading = "Uploading to OneDrive";
+                        network.Update(uploading, 0);
+                        await Cloud.UploadAsync(session, encrypted, token, progress, bytes => network.Update(uploading, bytes));
+                        network.Update("Waiting for recipient to download…");
                         var url = await Cloud.DownloadUrlAsync(id, token);
                         await SendPacketAsync(link, new Wire("route", id, Urls: [url.AbsoluteUri], Route: "cloud"), token);
                         Require(await transaction.NextAsync(TransferTimeout), "complete");
                     }
                     finally { if (session is not null) await Cloud.CleanupAsync(id, session); }
                 }
+                network.Finish();
             }
         }
         catch (Exception error)
@@ -278,9 +316,13 @@ internal sealed class BluetoothServer : IDisposable
             var token = transaction.Lifetime.Token;
             string id = transaction.Id;
             TransferFile? received = null;
+            TransferProgressReporter? incoming = null;
+            bool queued = false;
             try
             {
                 Transfer.Validate(offer);
+                if ((offer.Secure || offer.Route == "cloud-deferred") && link.Version < WireProtocol.CloudAndSecure)
+                    throw new IOException("This transfer requires a newer version of Pipopu.");
                 bool pair = !Trust.Contains(link.Session.Identity) || offer.Pair;
                 await SendPacketAsync(link, new Wire("review", id, Pair: pair), token);
                 if (pair)
@@ -291,6 +333,24 @@ internal sealed class BluetoothServer : IDisposable
                 if (pair)
                     Trust.Remember(link.Session.Identity, link.Name);
 
+                if (offer.Size > Transfer.Limit || offer.Route == "cloud-deferred")
+                    incoming = new TransferProgressReporter(id, string.IsNullOrWhiteSpace(offer.Name) ? "Incoming message" : offer.Name,
+                        FileCipher.EncryptedSize(offer.Size), value => IncomingTransferProgress?.Invoke(value));
+
+                if (offer.Route == "cloud-deferred")
+                {
+                    incoming!.Update("Acquiring OneDrive upload link…");
+                    var message = await transaction.NextAsync(PairingTimeout);
+                    Require(message, "cloud-key");
+                    if (message.Data is not { Length: 32 } key)
+                        throw new InvalidDataException("The cloud encryption key is missing.");
+                    Uri upload = await Deferred.PrepareIncomingAsync(link.Session.Identity, link.Name, offer, key, token);
+                    queued = true;
+                    Deferred.TrackIncoming(id, incoming);
+                    await SendPacketAsync(link, new Wire("cloud-upload", id, Urls: [upload.AbsoluteUri], Route: "cloud"), token);
+                    return;
+                }
+
                 var kind = (TransferKind)offer.Kind;
                 Transfer transfer;
                 if (offer.Size <= Transfer.Limit)
@@ -299,7 +359,7 @@ internal sealed class BluetoothServer : IDisposable
                     Require(message, "data");
                     if (message.Data is not { } bytes || bytes.LongLength != offer.Size)
                         throw new InvalidDataException("The payload size did not match the offer.");
-                    transfer = new Transfer(kind, offer.Name!, bytes);
+                    transfer = new Transfer(kind, offer.Name!, bytes, Secure: offer.Secure);
                     if (kind == TransferKind.Text)
                         _ = transfer.Text;
                 }
@@ -307,8 +367,11 @@ internal sealed class BluetoothServer : IDisposable
                 {
                     long encryptedSize = FileCipher.EncryptedSize(offer.Size);
                     using var lanFile = new TransferFile(TransferFile.TemporaryPath(), encryptedSize);
-                    if (await TryLanAsync(link, transaction, lanFile, upload: true))
+                    incoming!.Update("Waiting for local network upload…");
+                    if (await TryLanAsync(link, transaction, lanFile, upload: true,
+                        bytesMoved: bytes => incoming.Update("Receiving over local network", bytes)))
                     {
+                        incoming.Update("Verifying file…");
                         await using var input = File.OpenRead(lanFile.Path);
                         received = await FileCipher.TransformAsync(input, offer.Size, link.Session.FileKey(id), false, token);
                     }
@@ -318,10 +381,27 @@ internal sealed class BluetoothServer : IDisposable
                         Uri? session = null;
                         try
                         {
+                            incoming.Update("Acquiring OneDrive upload link…");
                             session = await Cloud.CreateUploadAsync(cloudId, token);
-                            await SendPacketAsync(link, new Wire("route", id, Urls: [session.AbsoluteUri], Route: "cloud"), token);
-                            Require(await transaction.NextAsync(TransferTimeout), "uploaded");
-                            using var cloudFile = await Cloud.DownloadAsync(cloudId, encryptedSize, token);
+                            using (var monitor = CancellationTokenSource.CreateLinkedTokenSource(token))
+                            {
+                                incoming.Update(CloudTransfers.AwaitingUpload, 0);
+                                var monitorTask = MonitorUploadAsync(session, encryptedSize, incoming, monitor.Token);
+                                try
+                                {
+                                    await SendPacketAsync(link, new Wire("route", id, Urls: [session.AbsoluteUri], Route: "cloud"), token);
+                                    Require(await transaction.NextAsync(TransferTimeout), "uploaded");
+                                }
+                                finally
+                                {
+                                    await monitor.CancelAsync();
+                                    await monitorTask;
+                                }
+                            }
+                            incoming.Update(CloudTransfers.Downloading, 0);
+                            using var cloudFile = await Cloud.DownloadAsync(cloudId, encryptedSize, token,
+                                bytes => incoming.Update(CloudTransfers.Downloading, bytes));
+                            incoming.Update("Verifying file…");
                             await using var input = File.OpenRead(cloudFile.Path);
                             received = await FileCipher.TransformAsync(input, offer.Size, link.Session.FileKey(id), false, token);
                         }
@@ -341,12 +421,16 @@ internal sealed class BluetoothServer : IDisposable
                 }
 
                 token.ThrowIfCancellationRequested();
+                incoming?.Finish();
                 TransferReceived?.Invoke(transfer);
                 received = null;
                 await SendPacketAsync(link, new Wire("complete", id), token);
             }
             catch (Exception error)
             {
+                if (!queued)
+                    incoming?.Finish(transaction.PeerError ?? (error is OperationCanceledException or TimeoutException
+                        ? "The sending device stopped responding." : error.Message));
                 if (transaction.PeerError is null)
                     await ReplyBestEffortAsync(link, new Wire("fail", id, Error: error.Message));
             }
@@ -358,12 +442,35 @@ internal sealed class BluetoothServer : IDisposable
         }
     }
 
+    private static async Task MonitorUploadAsync(Uri session, long size, TransferProgressReporter progress,
+        CancellationToken cancellation)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(cancellation))
+            {
+                try
+                {
+                    var status = await OneDrive.UploadStatusAsync(session, cancellation);
+                    if (status.Bytes is long bytes)
+                        progress.Update(CloudTransfers.AwaitingUpload, Math.Min(bytes, size));
+                }
+                catch (Exception error) when (error is IOException or HttpRequestException or System.Text.Json.JsonException)
+                {
+                    Debug.WriteLine(error.GetType().Name);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+    }
+
     private async Task<bool> TryLanAsync(Link link, Transaction transaction, TransferFile file, bool upload,
-        IProgress<int>? progress = null)
+        IProgress<int>? progress = null, Action<long>? bytesMoved = null)
     {
         var token = transaction.Lifetime.Token;
         LanTransfer server;
-        try { server = await LanTransfer.OpenAsync(file, upload, token, progress); }
+        try { server = await LanTransfer.OpenAsync(file, upload, token, progress, bytesMoved); }
         catch (Exception error) when (!token.IsCancellationRequested && error is IOException or System.Net.Sockets.SocketException)
         {
             return false;
@@ -549,6 +656,7 @@ internal sealed class BluetoothServer : IDisposable
         Transaction? inbound = null;
         bool busy = false;
         bool incompatible = false;
+        bool cloudCommand = false;
         lock (gate)
         {
             if (!links.TryGetValue(id, out link!))
@@ -564,6 +672,7 @@ internal sealed class BluetoothServer : IDisposable
                     link.Version = version;
                     link.Name = name;
                     link.Receives = message.Receive;
+                    link.RemoteTrust = !message.Pair;
                 }
             }
             else if (link.Version is null || (message.Version ?? WireProtocol.Legacy) != link.Version)
@@ -574,6 +683,11 @@ internal sealed class BluetoothServer : IDisposable
                     transfer.PeerError = "The other device changed the transfer protocol.";
                     transfer.Lifetime.Cancel();
                 }
+            }
+            else if (link.Version >= WireProtocol.CloudAndSecure &&
+                (message.Type is "cloud-list" or "cloud-fetch" or "cloud-delivered" or "cloud-upload-error"))
+            {
+                cloudCommand = Trust.Contains(link.Session.Identity);
             }
             else if (message.Type == "offer" && message.Id is { } transferId && link.Name.Length > 0)
             {
@@ -609,8 +723,40 @@ internal sealed class BluetoothServer : IDisposable
         }
         else if (inbound is not null)
             await ReceiveAsync(link, inbound, message);
+        else if (cloudCommand)
+            await HandleCloudAsync(link, message);
         else if (busy)
-            await ReplyBestEffortAsync(link, new Wire("fail", message.Id, Error: "The PC is busy. Try again in a moment."));
+            await ReplyBestEffortAsync(link, new Wire("fail", message.Id, Error: "The other device is busy. Try again in a moment."));
+    }
+
+    private async Task HandleCloudAsync(Link link, Wire message)
+    {
+        try
+        {
+            switch (message.Type)
+            {
+                case "cloud-list":
+                    await ReplyBestEffortAsync(link, new Wire("cloud-inbox", Data: Deferred.Inbox(link.Session.Identity)));
+                    break;
+                case "cloud-fetch" when message.Id is { } id:
+                    using (var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30)))
+                    {
+                        var ticket = await Deferred.DownloadTicketAsync(link.Session.Identity, id, deadline.Token);
+                        await SendPacketAsync(link, ticket, deadline.Token);
+                    }
+                    break;
+                case "cloud-delivered" when message.Id is { } id:
+                    Deferred.Acknowledge(link.Session.Identity, id);
+                    break;
+                case "cloud-upload-error" when message.Id is { } id:
+                    Deferred.UploadFailed(link.Session.Identity, id, message.Error);
+                    break;
+            }
+        }
+        catch (Exception error)
+        {
+            await ReplyBestEffortAsync(link, new Wire("cloud-error", message.Id, Error: error.Message));
+        }
     }
 
     private void OnSubscribersChanged(GattLocalCharacteristic sender, object args)

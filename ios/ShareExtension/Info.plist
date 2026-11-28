@@ -6,7 +6,7 @@
     <dict><key>NSAllowsLocalNetworking</key><true/></dict>
     <key>CFBundleDisplayName</key><string>Pipopu</string>
     <key>NSBluetoothAlwaysUsageDescription</key>
-    <string>Pipopu uses Bluetooth to send shared text, images, and files to nearby Windows PCs.</string>
+    <string>Pipopu uses Bluetooth to send shared text, images, and files to nearby devices.</string>
     <key>NSExtension</key>
     <dict>
         <key>NSExtensionAttributes</key>

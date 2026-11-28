@@ -64,7 +64,8 @@ public class FlyoutWindow : Window
         bool slide = animate && !IsVisible && SystemParameters.ClientAreaAnimation;
         MoveToCorner(slide ? EntranceDistance : 0);
         Show();
-        Activate();
+        if (ShowActivated)
+            Activate();
         if (slide)
         {
             elapsed.Restart();

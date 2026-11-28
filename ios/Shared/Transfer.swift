@@ -11,18 +11,24 @@ struct Transfer: Identifiable, Sendable {
     let name: String
     let data: Data
     let file: TemporaryFile?
+    let secure: Bool
+    let replay: Bool
     var size: Int64 { file?.size ?? Int64(data.count) }
     var text: String { String(decoding: data, as: UTF8.self) }
 
-    init(kind: Kind, name: String = "", data: Data, file: TemporaryFile? = nil) throws {
+    init(kind: Kind, name: String = "", data: Data, file: TemporaryFile? = nil, secure: Bool = false,
+         replay: Bool = false) throws {
         guard data.count <= (kind == .text ? Self.textLimit : Self.limit), (file?.size ?? 0) <= Self.fileLimit
         else { throw TransferError.tooLarge }
-        guard name.utf8.count <= 255, kind != .text || (file == nil && String(data: data, encoding: .utf8) != nil)
+        guard name.utf8.count <= 255, kind != .text || (file == nil && String(data: data, encoding: .utf8) != nil),
+              !secure || (kind == .text && data.count <= Self.limit)
         else { throw TransferError.invalid }
         self.kind = kind
         self.name = name
         self.data = data
         self.file = file
+        self.secure = secure
+        self.replay = replay
     }
 
     static func importFile(_ url: URL, kind: Kind, name: String) throws -> Transfer {
@@ -83,6 +89,57 @@ enum TransferError: LocalizedError {
         case .timedOut: "The other device stopped responding."
         case .message(let text): text
         }
+    }
+}
+
+enum CloudArchive {
+    private struct Item: Codable {
+        let name: String
+        let kind: UInt8
+        let size: Int64
+    }
+
+    static func contains(_ id: String) -> Bool {
+        guard let url = try? itemDirectory(id) else { return false }
+        return FileManager.default.fileExists(atPath: url.appendingPathComponent("item.json").path)
+    }
+
+    static func save(_ decoded: TemporaryFile, id: String, kind: Transfer.Kind, name: String) throws -> Transfer {
+        let folder = try itemDirectory(id)
+        let files = FileManager.default
+        try files.createDirectory(at: folder, withIntermediateDirectories: true)
+        let payload = folder.appendingPathComponent("payload")
+        let metadata = folder.appendingPathComponent("item.json")
+        if !files.fileExists(atPath: metadata.path) {
+            if files.fileExists(atPath: payload.path) { try files.removeItem(at: payload) }
+            try files.moveItem(at: decoded.url, to: payload)
+            try JSONEncoder().encode(Item(name: name, kind: kind.rawValue, size: decoded.size))
+                .write(to: metadata, options: .atomic)
+        }
+        return try open(id, replay: false)
+    }
+
+    static func open(_ id: String, replay: Bool = true) throws -> Transfer {
+        let folder = try itemDirectory(id)
+        let item = try JSONDecoder().decode(Item.self, from: Data(contentsOf: folder.appendingPathComponent("item.json")))
+        guard let kind = Transfer.Kind(rawValue: item.kind) else { throw TransferError.invalid }
+        let payload = folder.appendingPathComponent("payload")
+        if kind == .text {
+            return try Transfer(kind: kind, name: item.name, data: Data(contentsOf: payload), replay: replay)
+        }
+        return try Transfer(kind: kind, name: item.name, data: Data(),
+                            file: TemporaryFile(url: payload, size: item.size), replay: replay)
+    }
+
+    static func valid(_ id: String) -> Bool {
+        id.utf8.count == 32 && id.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+    }
+
+    private static func itemDirectory(_ id: String) throws -> URL {
+        guard valid(id) else { throw TransferError.invalid }
+        let support = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                                  appropriateFor: nil, create: true)
+        return support.appendingPathComponent("Pipopu Cloud", isDirectory: true).appendingPathComponent(id, isDirectory: true)
     }
 }
 

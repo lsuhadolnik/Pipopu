@@ -272,36 +272,110 @@ internal partial class Composer : FlyoutWindow
 
     private void RefreshSend()
     {
-        if (SendButton is not null)
-            SendButton.IsEnabled = !sending && Peers.SelectedItem is BluetoothServer.Peer &&
-                (attachment is not null || Message.Text.Length > 0);
+        if (SendButton is null)
+            return;
+        bool hasPeer = !sending && Peers.SelectedItem is BluetoothServer.Peer;
+        bool hasDraft = attachment is not null || Message.Text.Length > 0;
+        SendButton.IsEnabled = hasPeer && hasDraft;
+        SendOptions.IsEnabled = !sending && (hasPeer || (hasDraft && server.Trust.All().Length > 0));
     }
 
-    private async void SendClick(object sender, RoutedEventArgs e)
+    private void SendOptionsClick(object sender, RoutedEventArgs e)
     {
-        if (sending || Peers.SelectedItem is not BluetoothServer.Peer peer)
+        SecureSendOption.IsEnabled = Peers.SelectedItem is BluetoothServer.Peer peer &&
+            peer.Version >= WireProtocol.CloudAndSecure;
+        CloudSendOption.IsEnabled = (attachment is not null || Message.Text.Length > 0) &&
+            (SecureSendOption.IsEnabled || (Peers.SelectedItem is null && server.Trust.All().Length > 0));
+        SendOptions.ContextMenu.PlacementTarget = SendOptions;
+        SendOptions.ContextMenu.IsOpen = true;
+    }
+
+    private async void SendClick(object sender, RoutedEventArgs e) => await SendDraftAsync(overCloud: false);
+
+    private async void SendCloudClick(object sender, RoutedEventArgs e)
+    {
+        if (Peers.SelectedItem is BluetoothServer.Peer)
+        {
+            await SendDraftAsync(overCloud: true);
+        }
+        else if (SettingsWindows.ChooseCloudRecipient(this, server.Trust) is { } recipient)
+        {
+            await SendAsync(attachment ?? new Transfer(TransferKind.Text, "", Encoding.UTF8.GetBytes(Message.Text)),
+                overCloud: true, offline: recipient);
+        }
+    }
+
+    private Task SendDraftAsync(bool overCloud) =>
+        SendAsync(attachment ?? new Transfer(TransferKind.Text, "", Encoding.UTF8.GetBytes(Message.Text)), overCloud);
+
+    private async void SendSecureClick(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            string value = Clipboard.ContainsText() ? Clipboard.GetText() : "";
+            if (value.Length == 0)
+            {
+                Status.Text = "Copy the text you want to send securely first.";
+                return;
+            }
+            if (Encoding.UTF8.GetByteCount(value) > Transfer.Limit)
+            {
+                Status.Text = "Secure clipboard text must be 500 KB or smaller.";
+                return;
+            }
+            await SendAsync(new Transfer(TransferKind.Text, "", Encoding.UTF8.GetBytes(value), Secure: true), overCloud: false);
+        }
+        catch (System.Runtime.InteropServices.ExternalException)
+        {
+            Status.Text = "The clipboard is busy. Try again.";
+        }
+    }
+
+    private async Task SendAsync(Transfer transfer, bool overCloud, KeyValuePair<string, string>? offline = null)
+    {
+        var peer = Peers.SelectedItem as BluetoothServer.Peer;
+        if (sending || (offline is null && peer is null))
             return;
+        string recipient = offline?.Value ?? peer!.Name;
 
         using var cancellation = new CancellationTokenSource();
         sendCancellation = cancellation;
         sending = true;
         RefreshSend();
         Status.Text = "";
-        SendView.Begin(peer.Name);
+        SendView.Begin(recipient);
         ComposeView.Visibility = Visibility.Collapsed;
         try
         {
-            var transfer = attachment ?? new Transfer(TransferKind.Text, "", Encoding.UTF8.GetBytes(Message.Text));
-            await server.SendAsync(peer, transfer, new Progress<int>(value =>
+            if (offline is { } trusted)
             {
-                if (sendCancellation == cancellation)
-                    SendView.Report(value);
-            }), cancellation.Token);
+                if (!server.Trust.Contains(trusted.Key))
+                    throw new IOException("This device is no longer trusted.");
+                await server.Deferred.EnqueueAsync(Guid.NewGuid().ToString("N"), trusted.Key, trusted.Value,
+                    transfer, cancellation.Token);
+            }
+            else
+            {
+                await server.SendAsync(peer!, transfer, new Progress<int>(value =>
+                {
+                    if (sendCancellation == cancellation)
+                        SendView.Report(value);
+                }), cancellation.Token, overCloud, new Progress<TransferProgress>(value =>
+                {
+                    if (sendCancellation == cancellation)
+                        SendView.ReportNetwork(value);
+                }));
+            }
             if (!exiting)
             {
-                SendView.Complete();
-                Status.Text = $"Delivered to {peer.Name}";
-                await Task.Delay(900);
+                if (overCloud)
+                    Status.Text = "Queued. Check Cloud transfers from the tray.";
+                else
+                {
+                    SendView.Complete();
+                    Status.Text = $"Delivered to {recipient}";
+                    await Task.Delay(900);
+                }
             }
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)

@@ -40,6 +40,7 @@ private struct ShareView: View {
     @State private var selectedPeer: UUID?
     @State private var sendAttempt: UUID?
     @State private var finishedAttempt: UUID?
+    @State private var cloudSelected = false
     @ScaledMetric(relativeTo: .body) private var tileWidth = 102.0
 
     private let accent = Color(red: 0.48, green: 0.32, blue: 0.89)
@@ -58,7 +59,7 @@ private struct ShareView: View {
                     }
 
                     VStack(alignment: .leading, spacing: 18) {
-                        Text("Nearby Windows PCs").font(.headline)
+                        Text("Nearby devices").font(.headline)
                             .accessibilityAddTraits(.isHeader)
                         if bluetooth.peers.isEmpty {
                             Label(bluetooth.state, systemImage: "dot.radiowaves.left.and.right")
@@ -73,13 +74,27 @@ private struct ShareView: View {
                                 ? tileWidth * Double(bluetooth.peers.count) + 12 : .infinity)
                             .frame(maxWidth: .infinity)
                         }
-                        if let result = bluetooth.result, !bluetooth.sendCompleted {
+                        if let stage = bluetooth.sendStage {
+                            Text(stage.label)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                            if let speed = bluetooth.uploadSpeedLabel {
+                                Label(speed, systemImage: "speedometer")
+                                    .font(.footnote.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+                        } else if let result = bluetooth.result, !bluetooth.sendCompleted {
+                            if let stage = bluetooth.sendFailureStage {
+                                Text(stage.label.trimmingCharacters(in: CharacterSet(charactersIn: "…")))
+                                    .font(.footnote.weight(.semibold))
+                            }
                             Label(result, systemImage: "exclamationmark.circle")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
                         }
                         if let code = bluetooth.pairingCode {
-                            Text("Check code \(code) on the PC, then approve the pairing there.")
+                            Text("Check code \(code) on the receiving device, then approve the pairing there.")
                                 .font(.footnote)
                         }
                     }
@@ -102,7 +117,7 @@ private struct ShareView: View {
         .sensoryFeedback(trigger: finishedAttempt) { _, _ in
             bluetooth.sendCompleted ? .success : .error
         }
-        .alert("Trust this PC?", isPresented: Binding(get: { bluetooth.pairing != nil }, set: { _ in }),
+        .alert("Trust this device?", isPresented: Binding(get: { bluetooth.pairing != nil }, set: { _ in }),
                presenting: bluetooth.pairing) { _ in
             Button("Trust device") { bluetooth.answerPairing(true) }
             Button("Decline", role: .cancel) { bluetooth.answerPairing(false) }
@@ -159,13 +174,7 @@ private struct ShareView: View {
         let delivered = isSelected && bluetooth.sendCompleted
 
         return Button {
-            guard let transfer else { return }
-            selectedPeer = peer.id
-            let attempt = UUID()
-            sendAttempt = attempt
-            bluetooth.send(transfer, to: peer.id) { [finishedAttempt = $finishedAttempt] in
-                finishedAttempt.wrappedValue = attempt
-            }
+            send(to: peer, overCloud: false)
         } label: {
             VStack(spacing: 8) {
                 ZStack {
@@ -201,17 +210,33 @@ private struct ShareView: View {
                     .lineLimit(2, reservesSpace: true)
                     .foregroundStyle(.primary)
                 if delivered {
-                    Text("Sent").font(.caption2).foregroundStyle(.secondary)
+                    Text(cloudSelected ? "Uploaded" : "Sent").font(.caption2).foregroundStyle(.secondary)
                 }
             }
             .frame(maxWidth: .infinity)
             .contentShape(Rectangle())
         }
         .buttonStyle(DeviceButtonStyle())
+        .contextMenu {
+            if peer.supportsCloudAndSecure {
+                Button("Send over cloud", systemImage: "icloud.and.arrow.up") { send(to: peer, overCloud: true) }
+            }
+        }
         .disabled(transfer == nil || !peer.connected || bluetooth.progress != nil || bluetooth.sendCompleted)
         .opacity(!isSelected && (bluetooth.progress != nil || bluetooth.sendCompleted) ? 0.55 : 1)
         .accessibilityLabel("Send to " + peer.name)
         .accessibilityValue(progress?.formatted(.percent.precision(.fractionLength(0))) ?? (delivered ? "Sent" : ""))
+    }
+
+    private func send(to peer: Bluetooth.Peer, overCloud: Bool) {
+        guard let transfer else { return }
+        selectedPeer = peer.id
+        cloudSelected = overCloud
+        let attempt = UUID()
+        sendAttempt = attempt
+        bluetooth.send(transfer, to: peer.id, overCloud: overCloud) { [finishedAttempt = $finishedAttempt] in
+            finishedAttempt.wrappedValue = attempt
+        }
     }
 
     private struct DeviceButtonStyle: ButtonStyle {

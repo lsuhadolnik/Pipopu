@@ -22,9 +22,18 @@ internal partial class SendProgressView : UserControl, IProgress<int>
         HeadingText.Text = "Sending";
         DeviceText.Text = deviceName;
         Status.Text = "Connecting over Bluetooth…";
+        NetworkSpeed.Visibility = Visibility.Collapsed;
         CancelButton.Visibility = Visibility.Visible;
         CancelButton.IsEnabled = true;
         Visibility = Visibility.Visible;
+    }
+
+    internal void ReportNetwork(TransferProgress progress)
+    {
+        NetworkSpeed.Visibility = progress.Done ? Visibility.Collapsed : Visibility.Visible;
+        NetworkSpeed.Text = progress.BytesPerSecond is double speed
+            ? $"{progress.Stage} · {TransferProgress.FormatBytes(speed)}/s"
+            : progress.Stage;
     }
 
     public void Report(int percentage)
@@ -49,6 +58,7 @@ internal partial class SendProgressView : UserControl, IProgress<int>
         HeadingText.Text = "Delivered";
         Glyph.Text = "\uE73E";
         Status.Text = "The device confirmed receipt.";
+        NetworkSpeed.Visibility = Visibility.Collapsed;
         CancelButton.Visibility = Visibility.Hidden;
         AnimateTo(1);
     }

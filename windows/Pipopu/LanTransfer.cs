@@ -21,7 +21,7 @@ internal sealed class LanTransfer : IAsyncDisposable
     internal Task Completion => completed.Task;
 
     internal static async Task<LanTransfer> OpenAsync(TransferFile file, bool upload, CancellationToken cancellation,
-        IProgress<int>? progress = null)
+        IProgress<int>? progress = null, Action<long>? bytesMoved = null)
     {
         var addresses = NetworkInterface.GetAllNetworkInterfaces()
             .Where(nic => nic.OperationalStatus == OperationalStatus.Up &&
@@ -65,12 +65,21 @@ internal sealed class LanTransfer : IAsyncDisposable
             using var operation = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, cancellation);
             try
             {
+                bytesMoved?.Invoke(0);
                 if (upload)
                 {
                     await using (var output = File.Create(file.Path))
                     {
-                        await context.Request.Body.CopyToAsync(output, operation.Token);
-                        if (output.Length != file.Size)
+                        var buffer = new byte[256 * 1024];
+                        long received = 0;
+                        int count;
+                        while ((count = await context.Request.Body.ReadAsync(buffer, operation.Token)) != 0)
+                        {
+                            await output.WriteAsync(buffer.AsMemory(0, count), operation.Token);
+                            received += count;
+                            bytesMoved?.Invoke(received);
+                        }
+                        if (received != file.Size)
                             throw new EndOfStreamException();
                     }
                     context.Response.StatusCode = StatusCodes.Status204NoContent;
@@ -88,6 +97,7 @@ internal sealed class LanTransfer : IAsyncDisposable
                     {
                         await context.Response.Body.WriteAsync(buffer.AsMemory(0, count), operation.Token);
                         sent += count;
+                        bytesMoved?.Invoke(sent);
                         int percent = (int)(95 * sent / file.Size);
                         if (percent != previous)
                         {

@@ -16,6 +16,7 @@ final class Bluetooth: NSObject, ObservableObject {
         let id: UUID
         var name: String
         var connected = false
+        var supportsCloudAndSecure = false
     }
 
     struct Pairing {
@@ -24,8 +25,25 @@ final class Bluetooth: NSObject, ObservableObject {
     }
 
     enum SendStage: Equatable {
-        case requestingTransfer, pairing, waitingForPC, encryptingFile, requestingLink
-        case checkingLocalNetwork, requestingOneDriveLink, bluetooth, localUpload, oneDriveUpload, confirming
+        case requestingTransfer, pairing, waitingForDevice, encryptingFile, requestingLink
+        case checkingLocalNetwork, requestingOneDriveLink, checkingOneDriveLink, bluetooth, localUpload, oneDriveUpload, confirming
+
+        var label: String {
+            switch self {
+            case .requestingTransfer: "Requesting transfer…"
+            case .pairing: "Confirm pairing"
+            case .waitingForDevice: "Waiting for the receiving device…"
+            case .encryptingFile: "Encrypting file…"
+            case .requestingLink: "Waiting for a transfer route…"
+            case .checkingLocalNetwork: "Connecting over the local network…"
+            case .requestingOneDriveLink: "Requesting a OneDrive upload link…"
+            case .checkingOneDriveLink: "Checking the OneDrive upload link…"
+            case .bluetooth: "Sending over Bluetooth…"
+            case .localUpload: "Uploading over the local network…"
+            case .oneDriveUpload: "Uploading to OneDrive…"
+            case .confirming: "Waiting for delivery confirmation…"
+            }
+        }
     }
 
     private static let deliveryConfirmationPoint = 0.95
@@ -53,6 +71,7 @@ final class Bluetooth: NSObject, ObservableObject {
         var deadline = Date().addingTimeInterval(120)
         var peerError: String?
         var cancelledByUser = false
+        var detached = false
 
         init(id: String) {
             self.id = id
@@ -98,6 +117,9 @@ final class Bluetooth: NSObject, ObservableObject {
     @Published private(set) var state = "Starting Bluetooth…"
     @Published private(set) var progress: Double?
     @Published private(set) var sendStage: SendStage?
+    @Published private(set) var sendFailureStage: SendStage?
+    @Published private(set) var sendQueued = false
+    @Published private var uploadBytesPerSecond: Double?
     @Published private(set) var result: String?
     @Published private(set) var received: Transfer?
     @Published private(set) var receiveError: String?
@@ -105,6 +127,15 @@ final class Bluetooth: NSObject, ObservableObject {
     @Published private(set) var pairing: Pairing?
     @Published private(set) var pairingCode: String?
     @Published private(set) var trustedDevices = TrustStore.all()
+    @Published private(set) var cloudNotices: [CloudNotice] = []
+    @Published private(set) var cloudStatus: String?
+    private var cloudByPeer: [String: [CloudNotice]] = {
+        guard let data = UserDefaults.standard.data(forKey: "PipopuCloudNotices") else { return [:] }
+        return (try? JSONDecoder().decode([String: [CloudNotice]].self, from: data)) ?? [:]
+    }()
+    private var downloadRequest: (id: String, peer: UUID)?
+    private var downloadRequestedAt = Date.distantPast
+    private var downloadingCloudFile = false
 
     var sendFraction: Double? {
         switch sendStage {
@@ -115,12 +146,22 @@ final class Bluetooth: NSObject, ObservableObject {
         }
     }
 
+    var uploadSpeedLabel: String? {
+        guard sendStage == .localUpload || sendStage == .oneDriveUpload else { return nil }
+        return uploadBytesPerSecond.map {
+            ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .binary) + "/s"
+        } ?? "Measuring speed…"
+    }
+
     private var central: CBCentralManager?
     private var links = [UUID: Link]()
     private var timer: Timer?
     private var receivingName: String?
     private var identity: P256.KeyAgreement.PrivateKey?
     private var sender: UUID?
+    private var sendTask: Task<Void, Never>?
+    private var detachedSend: Transaction?
+    private var uploadSample: (time: TimeInterval, bytes: Double)?
     private var confirmation: (Link, CheckedContinuation<Bool, Never>)?
 
     func start(receivingAs name: String? = nil) {
@@ -129,6 +170,7 @@ final class Bluetooth: NSObject, ObservableObject {
         catch { state = error.localizedDescription; return }
         receivingName = name
         trustedDevices = TrustStore.all()
+        publishCloudNotices()
         central = CBCentralManager(delegate: self, queue: .main)
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }
@@ -163,6 +205,8 @@ final class Bluetooth: NSObject, ObservableObject {
         do {
             try TrustStore.forget(peer.id)
             trustedDevices = TrustStore.all()
+            cloudByPeer[peer.id] = nil
+            publishCloudNotices()
             for link in links.values where link.session?.identity == peer.id && link.transfer != nil {
                 central?.cancelPeripheralConnection(link.peripheral)
             }
@@ -176,11 +220,19 @@ final class Bluetooth: NSObject, ObservableObject {
         pending?.1.resume(returning: accepted)
     }
 
-    func send(_ transfer: Transfer, to id: UUID, onFinish: @escaping () -> Void) {
-        guard sender == nil, let link = links[id], link.peer.connected, link.transfer == nil,
+    func send(_ transfer: Transfer, to id: UUID, overCloud: Bool = false, onFinish: @escaping () -> Void) {
+        guard sender == nil else { return }
+        sendCompleted = false
+        sendQueued = false
+        sendFailureStage = nil
+        guard let link = links[id], link.peer.connected, link.transfer == nil,
               let session = link.session else {
-            sendCompleted = false
-            result = TransferError.message("The selected PC is disconnected or busy.").localizedDescription
+            result = "The selected device is disconnected or busy."
+            onFinish()
+            return
+        }
+        if (transfer.secure || overCloud) && !link.peer.supportsCloudAndSecure {
+            result = "Update Pipopu on the receiving device to use this send option."
             onFinish()
             return
         }
@@ -191,12 +243,16 @@ final class Bluetooth: NSObject, ObservableObject {
         sendStage = .requestingTransfer
         let transaction = Transaction(id: UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())
         link.transfer = transaction
-        link.task = Task { [weak self] in
+        let task = Task { [weak self] in
             guard let self else { return }
             defer {
                 finish(link, transaction)
                 sender = nil
+                detachedSend = nil
+                sendTask = nil
                 progress = nil
+                uploadBytesPerSecond = nil
+                uploadSample = nil
                 sendStage = nil
                 pairingCode = nil
                 onFinish()
@@ -204,9 +260,10 @@ final class Bluetooth: NSObject, ObservableObject {
             do {
                 let pair = !TrustStore.contains(session.identity)
                 let offer = Wire(type: "offer", id: transaction.id, name: transfer.name, kind: Int(transfer.kind.rawValue),
-                                 size: transfer.size, pair: pair)
+                                 size: transfer.size, pair: pair, route: overCloud ? "cloud-deferred" : nil,
+                                 secure: transfer.secure)
                 try await transmit(offer, on: link)
-                sendStage = .waitingForPC
+                sendStage = .waitingForDevice
                 let review = try await transaction.next()
                 try expect(review, "review")
                 if pair || review.pair == true {
@@ -214,7 +271,7 @@ final class Bluetooth: NSObject, ObservableObject {
                     pairingCode = session.code
                     try await confirmTrust(link, session: session)
                 }
-                sendStage = .waitingForPC
+                sendStage = .waitingForDevice
                 try expect(await transaction.next(), "accept")
                 pairingCode = nil
                 try await transmit(Wire(type: "verified", id: transaction.id), on: link)
@@ -223,8 +280,8 @@ final class Bluetooth: NSObject, ObservableObject {
                     trustedDevices = TrustStore.all()
                 }
                 transaction.deadline = Date().addingTimeInterval(7200)
-                if transfer.size > Int64(Transfer.limit) {
-                    sendStage = .encryptingFile
+                if overCloud || transfer.size > Int64(Transfer.limit) {
+                    if transfer.size == 0 { throw TransferError.message("Choose a nonempty file or message for cloud delivery.") }
                     let file: TemporaryFile
                     if let existing = transfer.file {
                         file = existing
@@ -232,10 +289,38 @@ final class Bluetooth: NSObject, ObservableObject {
                         file = TemporaryFile(size: transfer.size)
                         try transfer.data.write(to: file.url)
                     }
+                    let cloudKey = overCloud ? SymmetricKey(size: .bits256) : nil
+                    var cloudUploadURL: URL?
+                    if let cloudKey {
+                        sendStage = .requestingOneDriveLink
+                        transaction.deadline = Date().addingTimeInterval(65)
+                        let key = cloudKey.withUnsafeBytes { Data($0) }
+                        try await transmit(Wire(type: "cloud-key", id: transaction.id, data: key), on: link)
+                        let ticket = try await transaction.next()
+                        try expect(ticket, "cloud-upload")
+                        detachedSend = transaction
+                        finish(link, transaction)
+                        sendStage = .checkingOneDriveLink
+                        cloudUploadURL = try BulkNetwork.cloudURL(ticket, forUpload: true)
+                    }
+                    sendStage = .encryptingFile
                     let input = try FileHandle(forReadingFrom: file.url)
                     defer { try? input.close() }
                     let encrypted = try await FileCipher.transform(input: input, size: transfer.size,
-                        key: session.key(for: transaction.id), encrypt: true)
+                        key: cloudKey ?? session.key(for: transaction.id), encrypt: true)
+                    if let cloudUploadURL {
+                        beginUpload(.oneDriveUpload)
+                        try await BulkNetwork.uploadCloud(cloudUploadURL, file: encrypted) {
+                            [weak self] value in
+                            guard let self, detachedSend === transaction, sendStage == .oneDriveUpload else { return }
+                            updateUploadProgress(value, size: encrypted.size)
+                        }
+                        sendCompleted = true
+                        sendQueued = true
+                        result = "(link.peer.name) can collect the file when it’s back online."
+                        refreshCloud()
+                        return
+                    }
                     sendStage = .requestingLink
                     let route = try await transaction.next()
                     try await upload(encrypted, route: route, link: link, transaction: transaction)
@@ -252,15 +337,28 @@ final class Bluetooth: NSObject, ObservableObject {
                 sendCompleted = true
                 result = "Sent"
             } catch {
+                sendFailureStage = sendStage
                 result = transaction.cancelledByUser ? "Transfer canceled." : (transaction.peerError ?? error.localizedDescription)
-                if transaction.peerError == nil && !Task.isCancelled && link.peer.connected {
-                    try? await transmit(Wire(type: "cancel", id: transaction.id), on: link)
+                if transaction.peerError == nil && (!Task.isCancelled || transaction.detached) && link.peer.connected {
+                    if transaction.detached {
+                        let message = Wire(type: "cloud-upload-error", id: transaction.id, error: result)
+                        Task { [weak self] in try? await self?.transmit(message, on: link) }
+                    } else {
+                        try? await transmit(Wire(type: "cancel", id: transaction.id), on: link)
+                    }
                 }
             }
         }
+        link.task = task
+        sendTask = task
     }
 
     func cancelSend() {
+        if let detachedSend {
+            detachedSend.cancelledByUser = true
+            sendTask?.cancel()
+            return
+        }
         guard let sender, let link = links[sender], let transaction = link.transfer else { return }
         transaction.cancelledByUser = true
         disconnect(link)
@@ -274,41 +372,61 @@ final class Bluetooth: NSObject, ObservableObject {
             do {
                 sendStage = .checkingLocalNetwork
                 let url = try await BulkNetwork.localURL(route.urls ?? [])
-                sendStage = .localUpload
+                beginUpload(.localUpload)
                 try await BulkNetwork.uploadLocal(url, file: encrypted) { [weak self] value in
                     guard let self, link.transfer === transaction, sendStage == .localUpload else { return }
-                    updateUploadProgress(value)
+                    updateUploadProgress(value, size: encrypted.size)
                 }
                 progress = Self.deliveryConfirmationPoint
                 return
             } catch {
                 try Task.checkCancellation()
                 sendStage = .requestingOneDriveLink
+                transaction.deadline = Date().addingTimeInterval(65)
+                uploadBytesPerSecond = nil
                 progress = 0
                 try await transmit(Wire(type: "fallback", id: transaction.id), on: link)
                 let next = try await transaction.next()
                 try expect(next, "route")
-                guard next.route == "cloud" else { throw TransferError.invalid }
+                guard next.route == "cloud" else {
+                    throw TransferError.message("The receiving device replied without a OneDrive upload route.")
+                }
+                transaction.deadline = Date().addingTimeInterval(7200)
                 try await uploadToOneDrive(encrypted, route: next, link: link, transaction: transaction)
             }
         } else if route.route == "cloud" {
             try await uploadToOneDrive(encrypted, route: route, link: link, transaction: transaction)
         } else {
-            throw TransferError.invalid
+            throw TransferError.message("The receiving device offered an unsupported transfer route.")
         }
     }
 
     private func uploadToOneDrive(_ encrypted: TemporaryFile, route: Wire, link: Link, transaction: Transaction) async throws {
-        let url = try BulkNetwork.cloudURL(route)
-        sendStage = .oneDriveUpload
+        sendStage = .checkingOneDriveLink
+        let url = try BulkNetwork.cloudURL(route, forUpload: true)
+        beginUpload(.oneDriveUpload)
         try await BulkNetwork.uploadCloud(url, file: encrypted) { [weak self] value in
             guard let self, link.transfer === transaction, sendStage == .oneDriveUpload else { return }
-            updateUploadProgress(value)
+            updateUploadProgress(value, size: encrypted.size)
         }
     }
 
-    private func updateUploadProgress(_ value: Double) {
+    private func beginUpload(_ stage: SendStage) {
+        sendStage = stage
+        uploadBytesPerSecond = nil
+        uploadSample = (ProcessInfo.processInfo.systemUptime, 0)
+    }
+
+    private func updateUploadProgress(_ value: Double, size: Int64) {
         progress = max(progress ?? 0, value * Self.deliveryConfirmationPoint)
+        let now = ProcessInfo.processInfo.systemUptime
+        let bytes = min(1, max(0, value)) * Double(size)
+        if let sample = uploadSample, bytes > sample.bytes,
+           now - sample.time >= 0.4 || (value >= 1 && now > sample.time) {
+            let speed = (bytes - sample.bytes) / (now - sample.time)
+            uploadBytesPerSecond = uploadBytesPerSecond.map { 0.65 * speed + 0.35 * $0 } ?? speed
+            uploadSample = (now, bytes)
+        }
     }
 
     private func receive(_ offer: Wire, on link: Link) {
@@ -330,6 +448,13 @@ final class Bluetooth: NSObject, ObservableObject {
             guard let self else { return }
             defer { finish(link, transaction) }
             do {
+                if offer.secure == true && (!link.peer.supportsCloudAndSecure || kind != .text ||
+                    size > Int64(Transfer.limit) || offer.route != nil) {
+                    throw TransferError.message("The secure text offer used an unsupported format.")
+                }
+                if offer.route == "cloud-deferred" && !link.peer.supportsCloudAndSecure {
+                    throw TransferError.message("This cloud transfer requires a newer version of Pipopu.")
+                }
                 let pair = offer.pair == true || !TrustStore.contains(session.identity)
                 try await transmit(Wire(type: "review", id: id, pair: pair), on: link)
                 if pair { try await confirmTrust(link, session: session) }
@@ -339,13 +464,18 @@ final class Bluetooth: NSObject, ObservableObject {
                     try TrustStore.remember(session.identity, name: link.peer.name)
                     trustedDevices = TrustStore.all()
                 }
+                if offer.route == "cloud-deferred" {
+                    return
+                }
                 transaction.deadline = Date().addingTimeInterval(7200)
                 let message = try await transaction.next()
                 let transfer: Transfer
                 if size <= Int64(Transfer.limit) {
                     try expect(message, "data")
-                    guard let data = message.data, Int64(data.count) == size else { throw TransferError.invalid }
-                    transfer = try Transfer(kind: kind, name: name, data: data)
+                    guard let data = message.data, Int64(data.count) == size else {
+                        throw TransferError.message("The received message size did not match the transfer offer.")
+                    }
+                    transfer = try Transfer(kind: kind, name: name, data: data, secure: offer.secure == true)
                 } else {
                     let encrypted = try await download(message, link: link, transaction: transaction,
                                                        size: FileCipher.encryptedSize(size))
@@ -390,7 +520,113 @@ final class Bluetooth: NSObject, ObservableObject {
     }
 
     private func expect(_ message: Wire, _ type: String) throws {
-        guard message.type == type else { throw TransferError.invalid }
+        guard message.type == type else { throw TransferError.message("The other device sent an unexpected message while waiting for \(type).") }
+    }
+
+    func refreshCloud() {
+        let available = links.values.filter {
+            $0.peer.connected && $0.peer.supportsCloudAndSecure && $0.session.map { TrustStore.contains($0.identity) } == true
+        }
+        guard !available.isEmpty else {
+            cloudStatus = "Connect to a paired device to refresh cloud transfers."
+            return
+        }
+        cloudStatus = "Checking cloud transfers…"
+        for link in available {
+            Task {
+                do { try await transmit(Wire(type: "cloud-list"), on: link) }
+                catch { cloudStatus = error.localizedDescription }
+            }
+        }
+    }
+
+    func hasCloudFile(_ notice: CloudNotice) -> Bool {
+        !notice.outgoing && CloudArchive.contains(notice.id)
+    }
+
+    func getCloudFile(_ notice: CloudNotice) {
+        guard !notice.outgoing else { return }
+        if hasCloudFile(notice) {
+            do { received = try CloudArchive.open(notice.id) }
+            catch { cloudStatus = error.localizedDescription }
+            return
+        }
+        guard downloadRequest == nil, let link = links.values.first(where: { link in
+            guard link.peer.connected, link.peer.supportsCloudAndSecure, let identity = link.session?.identity,
+                  TrustStore.contains(identity) else { return false }
+            return cloudByPeer[identity]?.contains(where: { $0.id == notice.id }) == true
+        }) else {
+            cloudStatus = "Connect to the paired device to request a fresh download link."
+            return
+        }
+        downloadRequest = (notice.id, link.peer.id)
+        downloadRequestedAt = Date()
+        cloudStatus = "Requesting the cloud file…"
+        Task {
+            do { try await transmit(Wire(type: "cloud-fetch", id: notice.id), on: link) }
+            catch {
+                downloadRequest = nil
+                cloudStatus = error.localizedDescription
+            }
+        }
+    }
+
+    private func publishCloudNotices() {
+        cloudNotices = cloudByPeer.values.flatMap { $0 }
+        if let data = try? JSONEncoder().encode(cloudByPeer) {
+            UserDefaults.standard.set(data, forKey: "PipopuCloudNotices")
+        }
+    }
+
+    private func cloudMessage(_ message: Wire, on link: Link, identity: String) {
+        guard TrustStore.contains(identity) else { return }
+        switch message.type {
+        case "cloud-inbox":
+            guard let data = message.data,
+                  let notices = try? JSONDecoder().decode([CloudNotice].self, from: data) else {
+                cloudStatus = "The other device returned an invalid cloud transfer list."
+                return
+            }
+            cloudByPeer[identity] = notices
+            publishCloudNotices()
+            if downloadRequest == nil { cloudStatus = nil }
+            for notice in notices where !notice.outgoing && notice.status == "Ready" && hasCloudFile(notice) {
+                Task { try? await transmit(Wire(type: "cloud-delivered", id: notice.id), on: link) }
+            }
+        case "cloud-error" where message.id == downloadRequest?.id:
+            downloadRequest = nil
+            cloudStatus = message.error ?? "The cloud file is unavailable."
+        case "cloud-ticket" where !downloadingCloudFile && message.id == downloadRequest?.id &&
+            link.peer.id == downloadRequest?.peer:
+            downloadingCloudFile = true
+            Task {
+                do {
+                    guard let id = message.id, CloudArchive.valid(id), let key = message.data, key.count == 32,
+                          let name = message.name, name.utf8.count <= 255,
+                          let raw = message.kind, let number = UInt8(exactly: raw), let kind = Transfer.Kind(rawValue: number),
+                          let size = message.size, size > 0, size <= Transfer.fileLimit,
+                          kind != .text || size <= Int64(Transfer.textLimit) else {
+                        throw TransferError.message("The other device returned an invalid cloud download ticket.")
+                    }
+                    cloudStatus = "Downloading from OneDrive…"
+                    let encrypted = try await BulkNetwork.download(BulkNetwork.cloudURL(message), cloud: true,
+                                                                  size: FileCipher.encryptedSize(size))
+                    let input = try FileHandle(forReadingFrom: encrypted.url)
+                    defer { try? input.close() }
+                    let clear = try await FileCipher.transform(input: input, size: size, key: SymmetricKey(data: key),
+                                                              encrypt: false)
+                    received = try CloudArchive.save(clear, id: id, kind: kind, name: name)
+                    publishCloudNotices()
+                    cloudStatus = "Downloaded."
+                    if link.peer.connected {
+                        try? await transmit(Wire(type: "cloud-delivered", id: id), on: link)
+                    }
+                } catch { cloudStatus = error.localizedDescription }
+                downloadRequest = nil
+                downloadingCloudFile = false
+            }
+        default: break
+        }
     }
 
     private func confirmTrust(_ link: Link, session: SecureSession) async throws {
@@ -427,8 +663,17 @@ final class Bluetooth: NSObject, ObservableObject {
 
     private func tick() {
         let now = Date()
+        if downloadRequest != nil && !downloadingCloudFile && now.timeIntervalSince(downloadRequestedAt) > 40 {
+            downloadRequest = nil
+            cloudStatus = "The other device did not return a download link. Refresh and try again."
+        }
         for (id, link) in Array(links) {
             if let transaction = link.transfer, now > transaction.deadline {
+                if transaction.peerError == nil {
+                    transaction.peerError = sendStage == .requestingOneDriveLink && sender == id
+                        ? "The receiving device did not return a OneDrive link in time. Check that it’s online and signed in to OneDrive."
+                        : TransferError.timedOut.localizedDescription
+                }
                 transaction.incoming.finish(throwing: TransferError.timedOut)
                 link.task?.cancel()
                 if confirmation?.0 === link { answerPairing(false) }
@@ -498,7 +743,13 @@ final class Bluetooth: NSObject, ObservableObject {
 
     private func dispatch(_ packet: Data, on link: Link) throws {
         if let session = link.session {
-            let message = try session.open(packet)
+            let message: Wire
+            do { message = try session.open(packet) }
+            catch is DecodingError {
+                throw TransferError.message("The other device sent a transfer message Pipopu could not read. Update Pipopu on both devices.")
+            } catch {
+                throw TransferError.message("Pipopu could not authenticate a Bluetooth message from the other device. Reconnect and try again.")
+            }
             if message.type == "ready", let name = message.name {
                 guard message.error == nil,
                       let selected = WireProtocol.negotiate(message.protocolMin, message.protocolMax),
@@ -508,26 +759,39 @@ final class Bluetooth: NSObject, ObservableObject {
                     state = error
                     throw TransferError.message(error)
                 }
+                let firstConnection = !link.peer.connected
                 link.version = selected
                 link.peer.name = name
                 link.peer.connected = true
+                link.peer.supportsCloudAndSecure = selected >= WireProtocol.cloudAndSecure
                 link.connectingSince = nil
                 publishPeers()
+                if firstConnection && receivingName != nil && link.peer.supportsCloudAndSecure &&
+                    TrustStore.contains(session.identity) {
+                    Task { try? await transmit(Wire(type: "cloud-list"), on: link) }
+                }
             } else if link.version == nil || (message.version ?? WireProtocol.legacy) != link.version {
-                throw TransferError.invalid
+                throw TransferError.message("The other device sent a message using a different transfer protocol version. Update Pipopu on both devices.")
+            } else if message.type == "cloud-inbox" || message.type == "cloud-ticket" || message.type == "cloud-error" {
+                cloudMessage(message, on: link, identity: session.identity)
             } else if message.type == "offer", link.peer.connected {
                 receive(message, on: link)
             } else if let transaction = link.transfer, message.id == transaction.id {
                 if message.type == "cancel" || message.type == "fail" {
-                    let failure = message.type == "cancel" ? "The PC cancelled the transfer." :
-                        message.error ?? "The PC declined the transfer."
+                    let failure = message.type == "cancel" ? "The other device cancelled the transfer." :
+                        message.error ?? "The other device declined the transfer."
                     transaction.peerError = failure
                     transaction.incoming.finish(throwing: TransferError.message(failure))
                     link.task?.cancel()
                     if confirmation?.0 === link { answerPairing(false) }
-                } else if case .dropped = transaction.incoming.yield(message) {
-                    transaction.incoming.finish(throwing: TransferError.invalid)
-                    link.task?.cancel()
+                } else {
+                    if message.type == "cloud-upload" { transaction.detached = true }
+                    if case .dropped = transaction.incoming.yield(message) {
+                        let message = "The other device sent more Bluetooth messages than expected for this transfer."
+                        transaction.peerError = message
+                        transaction.incoming.finish(throwing: TransferError.message(message))
+                        link.task?.cancel()
+                    }
                 }
             }
         } else {
@@ -543,7 +807,9 @@ final class Bluetooth: NSObject, ObservableObject {
         let name = String(decoding: device.utf8.prefix(60), as: UTF8.self)
         Task {
             do {
-                try await transmit(Wire(type: "ready", name: name, receive: receivingName != nil,
+                try await transmit(Wire(type: "ready", name: name,
+                                        pair: link.session.map { !TrustStore.contains($0.identity) },
+                                        receive: receivingName != nil,
                                         protocolMin: WireProtocol.minimum, protocolMax: WireProtocol.current), on: link)
             }
             catch { central?.cancelPeripheralConnection(link.peripheral) }
@@ -552,8 +818,17 @@ final class Bluetooth: NSObject, ObservableObject {
 
     private func disconnect(_ link: Link, error: Error? = nil) {
         let failure = error ?? TransferError.disconnected
-        link.transfer?.incoming.finish(throwing: failure)
-        link.task?.cancel()
+        if !downloadingCloudFile && downloadRequest?.peer == link.peer.id {
+            downloadRequest = nil
+            cloudStatus = "Connect to the paired device to request a fresh download link."
+        }
+        if link.transfer?.detached == true {
+            link.transfer = nil
+            link.task = nil
+        } else {
+            link.transfer?.incoming.finish(throwing: failure)
+            link.task?.cancel()
+        }
         if confirmation?.0 === link { answerPairing(false) }
         let writes = link.writes
         link.writes.removeAll()
@@ -566,6 +841,7 @@ final class Bluetooth: NSObject, ObservableObject {
         link.session = nil
         link.version = nil
         link.peer.connected = false
+        link.peer.supportsCloudAndSecure = false
     }
 }
 
@@ -591,7 +867,7 @@ extension Bluetooth: @preconcurrency CBCentralManagerDelegate {
         if links[peripheral.identifier] == nil {
             guard links.count < 16 else { return }
             let name = advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? peripheral.name
-            let fallback = "Windows PC · " + peripheral.identifier.uuidString.prefix(4)
+            let fallback = "Nearby device · " + peripheral.identifier.uuidString.prefix(4)
             links[peripheral.identifier] = Link(peripheral, name: name ?? fallback)
             publishPeers()
         }
@@ -678,14 +954,25 @@ extension Bluetooth: @preconcurrency CBPeripheralDelegate {
             case Frame.begin: link.incoming = try IncomingPacket(frame)
             case Frame.chunk: try link.incoming?.append(frame)
             case Frame.end:
-                guard let packet = try link.incoming?.finish(frame) else { throw TransferError.invalid }
+                guard let packet = try link.incoming?.finish(frame) else {
+                    throw TransferError.message("A Bluetooth message ended before Pipopu received its contents.")
+                }
                 link.incoming = nil
                 try dispatch(packet, on: link)
             default: throw TransferError.invalid
             }
             link.incomingAt = Date()
         } catch {
-            disconnect(link, error: error)
+            let failure: Error
+            if let transferError = error as? TransferError, case .invalid = transferError {
+                failure = TransferError.message("A Bluetooth message was incomplete or damaged. Reconnect the devices and try again.")
+            } else {
+                failure = error
+            }
+            if let transaction = link.transfer, !transaction.detached {
+                transaction.peerError = failure.localizedDescription
+            }
+            disconnect(link, error: failure)
             central?.cancelPeripheralConnection(peripheral)
         }
     }

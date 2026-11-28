@@ -108,6 +108,15 @@
       </Grid>
 
       <DockPanel Grid.Row="3" LastChildFill="True">
+        <Button x:Name="SendOptions" DockPanel.Dock="Right" Style="{DynamicResource QuietButton}"
+                Margin="4,0,0,0" Content="⋯" AutomationProperties.Name="Send options" Click="SendOptionsClick">
+          <Button.ContextMenu>
+            <ContextMenu>
+              <MenuItem x:Name="SecureSendOption" Header="Send securely" Click="SendSecureClick" />
+              <MenuItem x:Name="CloudSendOption" Header="Send over cloud" Click="SendCloudClick" />
+            </ContextMenu>
+          </Button.ContextMenu>
+        </Button>
         <Button x:Name="SendButton" DockPanel.Dock="Right" Style="{DynamicResource AccentButtonStyle}"
                 FontWeight="SemiBold" MinWidth="98" MinHeight="36" AutomationProperties.Name="Send"
                 IsEnabled="False" Click="SendClick">
