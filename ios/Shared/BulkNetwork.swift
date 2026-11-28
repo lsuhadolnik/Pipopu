@@ -12,7 +12,7 @@ private final class LocalNetworkPath: @unchecked Sendable {
             guard let self else { return }
             let local = path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet) ||
                 path.availableInterfaces.contains { $0.type == .wifi || $0.type == .wiredEthernet }
-            lock.withLock { available = local }
+            lock.withLock { self.available = local }
         }
         monitor.start(queue: DispatchQueue(label: "Pipopu.LocalNetworkPath"))
     }
