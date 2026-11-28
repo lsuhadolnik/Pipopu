@@ -32,7 +32,7 @@ private final class TransferRoutes: NSObject, URLSessionTaskDelegate, @unchecked
     func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64,
                     totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
         guard let progress, totalBytesExpectedToSend > 0 else { return }
-        let fraction = min(0.95, 0.95 * Double(totalBytesSent) / Double(totalBytesExpectedToSend))
+        let fraction = min(1, Double(totalBytesSent) / Double(totalBytesExpectedToSend))
         Task { @MainActor in progress(fraction) }
     }
 }
@@ -90,7 +90,7 @@ enum BulkNetwork {
         guard status(response) == 204 else { throw TransferError.message("The PC did not accept the local upload.") }
     }
 
-    static func uploadCloud(_ url: URL, file: TemporaryFile, progress: @MainActor (Double) -> Void) async throws {
+    static func uploadCloud(_ url: URL, file: TemporaryFile, progress: @escaping @MainActor (Double) -> Void) async throws {
         let client = session(cloud: true)
         defer { client.finishTasksAndInvalidate() }
         let source = try FileHandle(forReadingFrom: file.url)
@@ -105,13 +105,17 @@ enum BulkNetwork {
             request.httpMethod = "PUT"
             request.setValue("bytes \(offset)-\(end - 1)/\(file.size)", forHTTPHeaderField: "Content-Range")
             request.setValue(String(count), forHTTPHeaderField: "Content-Length")
-            let (_, response) = try await client.upload(for: request, from: bytes)
+            let start = offset
+            let observer = TransferRoutes(cloud: true) { fraction in
+                progress((Double(start) + Double(count) * fraction) / Double(file.size))
+            }
+            let (_, response) = try await client.upload(for: request, from: bytes, delegate: observer)
             let code = status(response)
             guard end < file.size ? code == 202 : code == 200 || code == 201 else {
                 throw TransferError.message("OneDrive upload failed (\(code)).")
             }
             offset = end
-            await progress(0.15 + 0.75 * Double(offset) / Double(file.size))
+            await progress(Double(offset) / Double(file.size))
         }
     }
 

@@ -22,6 +22,7 @@ private struct ReceiverView: View {
     @State private var attachment: Transfer?
     @State private var importing = false
     @State private var recipient: UUID?
+    @State private var fileSend: FileSend?
     @State private var sendStatus = ""
     @State private var sendAttempt: UUID?
     @State private var finishedAttempt: UUID?
@@ -31,73 +32,12 @@ private struct ReceiverView: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                brand
-                    .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets())
-                composer
-                recipients
-                Section("Trusted devices") {
-                    if bluetooth.trustedDevices.isEmpty {
-                        Text("No trusted devices yet.").foregroundStyle(.secondary)
-                    }
-                    ForEach(bluetooth.trustedDevices) { peer in
-                        LabeledContent(peer.name) {
-                            Button("Forget", role: .destructive) { bluetooth.forget(peer) }
-                                .buttonStyle(.borderless)
-                        }
-                    }
-                }
-                if let transfer = bluetooth.received {
-                    Section("Received") {
-                        if transfer.kind == .text {
-                            Text(transfer.text).textSelection(.enabled)
-                            Button("Copy text", systemImage: "doc.on.doc") {
-                                UIPasteboard.general.string = transfer.text
-                                status = "Copied text"
-                            }
-                        } else {
-                            if transfer.kind == .image, let image = imagePreview(transfer) {
-                                Image(uiImage: image).resizable().scaledToFit().frame(maxHeight: 240)
-                                Button("Copy image", systemImage: "doc.on.doc") {
-                                    UIPasteboard.general.image = image
-                                    status = "Copied image"
-                                }
-                            }
-                            Button("Save " + (transfer.name.isEmpty ? "item" : transfer.name), systemImage: "square.and.arrow.down") {
-                                if let file = transfer.file {
-                                    do { fileExport = try ExportFile(file, name: exportName) }
-                                    catch { status = error.localizedDescription }
-                                } else {
-                                    exporting = true
-                                }
-                            }
-                        }
-                        Button("Clear", role: .destructive) {
-                            bluetooth.clearReceived()
-                            status = ""
-                        }
-                    }
-                }
-                Section {
-                    Toggle("Available to receive", isOn: $listening)
-                    Toggle("Save received files automatically", isOn: $saveReceivedFiles)
-                    TextField("Name on Windows", text: $receiverName, prompt: Text(UIDevice.current.model))
-                        .onSubmit { updateListening() }
-                    if let message = bluetooth.receiveError {
-                        Text(message).font(.footnote).foregroundStyle(.secondary)
-                    }
-                } header: {
-                    Text("Receiving")
-                } footer: {
-                    Text("Keep Pipopu open to receive. Automatically saved files appear in On My iPhone or iPad → Pipopu → Received in Files.")
-                }
-                if !status.isEmpty { Text(status).foregroundStyle(.secondary) }
+            if let fileSend {
+                FileSendView(file: fileSend, bluetooth: bluetooth, tint: accent) { self.fileSend = nil }
+                    .toolbar(.hidden, for: .navigationBar)
+            } else {
+                home
             }
-            .listStyle(.insetGrouped)
-            .scrollDismissesKeyboard(.interactively)
-            .toolbar(.hidden, for: .navigationBar)
-            .tint(accent)
         }
         .onAppear(perform: updateListening)
         .onChange(of: phase) { _, _ in updateListening() }
@@ -135,6 +75,76 @@ private struct ReceiverView: View {
             case .failure(let error): status = error.localizedDescription
             }
         }
+    }
+
+    private var home: some View {
+        List {
+            brand
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets())
+            composer
+            recipients
+            Section("Trusted devices") {
+                if bluetooth.trustedDevices.isEmpty {
+                    Text("No trusted devices yet.").foregroundStyle(.secondary)
+                }
+                ForEach(bluetooth.trustedDevices) { peer in
+                    LabeledContent(peer.name) {
+                        Button("Forget", role: .destructive) { bluetooth.forget(peer) }
+                            .buttonStyle(.borderless)
+                    }
+                }
+            }
+            if let transfer = bluetooth.received {
+                Section("Received") {
+                    if transfer.kind == .text {
+                        Text(transfer.text).textSelection(.enabled)
+                        Button("Copy text", systemImage: "doc.on.doc") {
+                            UIPasteboard.general.string = transfer.text
+                            status = "Copied text"
+                        }
+                    } else {
+                        if transfer.kind == .image, let image = imagePreview(transfer) {
+                            Image(uiImage: image).resizable().scaledToFit().frame(maxHeight: 240)
+                            Button("Copy image", systemImage: "doc.on.doc") {
+                                UIPasteboard.general.image = image
+                                status = "Copied image"
+                            }
+                        }
+                        Button("Save " + (transfer.name.isEmpty ? "item" : transfer.name), systemImage: "square.and.arrow.down") {
+                            if let file = transfer.file {
+                                do { fileExport = try ExportFile(file, name: exportName) }
+                                catch { status = error.localizedDescription }
+                            } else {
+                                exporting = true
+                            }
+                        }
+                    }
+                    Button("Clear", role: .destructive) {
+                        bluetooth.clearReceived()
+                        status = ""
+                    }
+                }
+            }
+            Section {
+                Toggle("Available to receive", isOn: $listening)
+                Toggle("Save received files automatically", isOn: $saveReceivedFiles)
+                TextField("Name on Windows", text: $receiverName, prompt: Text(UIDevice.current.model))
+                    .onSubmit { updateListening() }
+                if let message = bluetooth.receiveError {
+                    Text(message).font(.footnote).foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Receiving")
+            } footer: {
+                Text("Keep Pipopu open to receive. Automatically saved files appear in On My iPhone or iPad → Pipopu → Received in Files.")
+            }
+            if !status.isEmpty { Text(status).foregroundStyle(.secondary) }
+        }
+        .listStyle(.insetGrouped)
+        .scrollDismissesKeyboard(.interactively)
+        .toolbar(.hidden, for: .navigationBar)
+        .tint(accent)
     }
 
     private var brand: some View {
@@ -263,6 +273,9 @@ private struct ReceiverView: View {
             editingDraft = false
             sendStatus = ""
             recipient = peer.id
+            if transfer.kind != .text {
+                fileSend = FileSend(name: transfer.name, size: transfer.size, recipient: peer.name)
+            }
             let attempt = UUID()
             sendAttempt = attempt
             bluetooth.send(transfer, to: peer.id) { [sendStatus = $sendStatus, finishedAttempt = $finishedAttempt, weak bluetooth] in
@@ -401,6 +414,123 @@ private struct LargeFileExporter: UIViewControllerRepresentable {
     }
 
     func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
+}
+
+private struct FileSend {
+    let name: String
+    let size: Int64
+    let recipient: String
+}
+
+private struct FileSendView: View {
+    let file: FileSend
+    @ObservedObject var bluetooth: Bluetooth
+    let tint: Color
+    let close: () -> Void
+    @State private var cancelling = false
+
+    private var fraction: Double? {
+        cancelling ? nil : bluetooth.sendFraction
+    }
+
+    private var title: String {
+        if cancelling && bluetooth.sendStage != nil { return "Canceling transfer…" }
+        switch bluetooth.sendStage {
+        case .requestingTransfer: return "Requesting transfer…"
+        case .waitingForPC: return "Waiting for the PC…"
+        case .pairing: return "Confirm pairing"
+        case .encryptingFile: return "Encrypting file…"
+        case .requestingLink: return "Requesting upload link…"
+        case .checkingLocalNetwork: return "Connecting over the local network…"
+        case .requestingOneDriveLink: return "Requesting a OneDrive upload link…"
+        case .bluetooth: return "Sending over Bluetooth…"
+        case .localUpload: return "Uploading to the PC…"
+        case .oneDriveUpload: return "Uploading to OneDrive…"
+        case .confirming: return "Waiting for delivery confirmation…"
+        case nil: return bluetooth.sendCompleted ? "File sent" : (cancelling ? "Transfer canceled" : "Transfer failed")
+        }
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 24) {
+                VStack(spacing: 6) {
+                    Text(file.name.isEmpty ? "Shared file" : file.name)
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(3)
+                    Text(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    Label(file.recipient, systemImage: "desktopcomputer")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 4)
+                }
+
+                ring
+
+                VStack(spacing: 10) {
+                    Text(title)
+                        .font(.headline)
+                        .accessibilityAddTraits(.isHeader)
+                    if bluetooth.sendStage == .pairing, let code = bluetooth.pairingCode {
+                        Text(code)
+                            .font(.title3.monospacedDigit())
+                            .textSelection(.enabled)
+                            .accessibilityLabel("Pairing code \(code)")
+                    }
+                    if bluetooth.sendStage == nil, !bluetooth.sendCompleted, !cancelling,
+                       let error = bluetooth.result {
+                        Text(error).font(.subheadline).foregroundStyle(.secondary)
+                    }
+                }
+
+                if bluetooth.sendStage != nil {
+                    Button("Cancel transfer", role: .cancel) {
+                        cancelling = true
+                        bluetooth.cancelSend()
+                    }
+                    .disabled(cancelling)
+                } else {
+                    Button(bluetooth.sendCompleted ? "Done" : "Back to Pipopu", action: close)
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 28)
+            .padding(.vertical, 48)
+            .frame(maxWidth: 480)
+            .frame(maxWidth: .infinity)
+        }
+        .background(Color(uiColor: .systemGroupedBackground))
+        .tint(tint)
+    }
+
+    private var ring: some View {
+        ZStack {
+            Circle()
+                .strokeBorder(tint.opacity(0.15), lineWidth: 8)
+            if let fraction, !cancelling {
+                Circle()
+                    .trim(from: 0, to: fraction)
+                    .stroke(tint, style: StrokeStyle(lineWidth: 8, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .padding(4)
+                Text(fraction, format: .percent.precision(.fractionLength(0)))
+                    .font(.title.monospacedDigit().weight(.semibold))
+            } else if bluetooth.sendStage != nil {
+                ProgressView().controlSize(.large)
+            } else {
+                Image(systemName: bluetooth.sendCompleted ? "checkmark" : (cancelling ? "xmark" : "exclamationmark"))
+                    .font(.system(size: 44, weight: .medium))
+            }
+        }
+        .foregroundStyle(tint)
+        .frame(width: 172, height: 172)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Transfer progress")
+        .accessibilityValue(fraction?.formatted(.percent.precision(.fractionLength(0))) ?? title)
+    }
 }
 
 private struct ReceivedDocument: FileDocument {

@@ -23,6 +23,13 @@ final class Bluetooth: NSObject, ObservableObject {
         let code: String
     }
 
+    enum SendStage: Equatable {
+        case requestingTransfer, pairing, waitingForPC, encryptingFile, requestingLink
+        case checkingLocalNetwork, requestingOneDriveLink, bluetooth, localUpload, oneDriveUpload, confirming
+    }
+
+    private static let deliveryConfirmationPoint = 0.95
+
     private final class Write {
         let packet: Data
         let token = UInt32.random(in: .min ... .max)
@@ -45,6 +52,7 @@ final class Bluetooth: NSObject, ObservableObject {
         private var iterator: AsyncThrowingStream<Wire, Error>.Iterator
         var deadline = Date().addingTimeInterval(120)
         var peerError: String?
+        var cancelledByUser = false
 
         init(id: String) {
             self.id = id
@@ -89,6 +97,7 @@ final class Bluetooth: NSObject, ObservableObject {
     @Published private(set) var peers = [Peer]()
     @Published private(set) var state = "Starting Bluetooth…"
     @Published private(set) var progress: Double?
+    @Published private(set) var sendStage: SendStage?
     @Published private(set) var result: String?
     @Published private(set) var received: Transfer?
     @Published private(set) var receiveError: String?
@@ -96,6 +105,15 @@ final class Bluetooth: NSObject, ObservableObject {
     @Published private(set) var pairing: Pairing?
     @Published private(set) var pairingCode: String?
     @Published private(set) var trustedDevices = TrustStore.all()
+
+    var sendFraction: Double? {
+        switch sendStage {
+        case .bluetooth, .localUpload, .oneDriveUpload:
+            return min(1, (progress ?? 0) / Self.deliveryConfirmationPoint)
+        default:
+            return nil
+        }
+    }
 
     private var central: CBCentralManager?
     private var links = [UUID: Link]()
@@ -170,6 +188,7 @@ final class Bluetooth: NSObject, ObservableObject {
         sendCompleted = false
         result = nil
         progress = 0
+        sendStage = .requestingTransfer
         let transaction = Transaction(id: UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())
         link.transfer = transaction
         link.task = Task { [weak self] in
@@ -178,6 +197,7 @@ final class Bluetooth: NSObject, ObservableObject {
                 finish(link, transaction)
                 sender = nil
                 progress = nil
+                sendStage = nil
                 pairingCode = nil
                 onFinish()
             }
@@ -186,12 +206,15 @@ final class Bluetooth: NSObject, ObservableObject {
                 let offer = Wire(type: "offer", id: transaction.id, name: transfer.name, kind: Int(transfer.kind.rawValue),
                                  size: transfer.size, pair: pair)
                 try await transmit(offer, on: link)
+                sendStage = .waitingForPC
                 let review = try await transaction.next()
                 try expect(review, "review")
                 if pair || review.pair == true {
+                    sendStage = .pairing
                     pairingCode = session.code
                     try await confirmTrust(link, session: session)
                 }
+                sendStage = .waitingForPC
                 try expect(await transaction.next(), "accept")
                 pairingCode = nil
                 try await transmit(Wire(type: "verified", id: transaction.id), on: link)
@@ -201,6 +224,7 @@ final class Bluetooth: NSObject, ObservableObject {
                 }
                 transaction.deadline = Date().addingTimeInterval(7200)
                 if transfer.size > Int64(Transfer.limit) {
+                    sendStage = .encryptingFile
                     let file: TemporaryFile
                     if let existing = transfer.file {
                         file = existing
@@ -212,19 +236,23 @@ final class Bluetooth: NSObject, ObservableObject {
                     defer { try? input.close() }
                     let encrypted = try await FileCipher.transform(input: input, size: transfer.size,
                         key: session.key(for: transaction.id), encrypt: true)
+                    sendStage = .requestingLink
                     let route = try await transaction.next()
                     try await upload(encrypted, route: route, link: link, transaction: transaction)
+                    sendStage = .confirming
                     try await transmit(Wire(type: "uploaded", id: transaction.id), on: link)
                 } else {
+                    sendStage = .bluetooth
                     try await transmit(Wire(type: "data", id: transaction.id, data: transfer.data), on: link) {
-                        [weak self] value in self?.progress = value * 0.95
+                        [weak self] value in self?.progress = value * Self.deliveryConfirmationPoint
                     }
+                    sendStage = .confirming
                 }
                 try expect(await transaction.next(), "complete")
                 sendCompleted = true
                 result = "Sent"
             } catch {
-                result = transaction.peerError ?? error.localizedDescription
+                result = transaction.cancelledByUser ? "Transfer canceled." : (transaction.peerError ?? error.localizedDescription)
                 if transaction.peerError == nil && !Task.isCancelled && link.peer.connected {
                     try? await transmit(Wire(type: "cancel", id: transaction.id), on: link)
                 }
@@ -232,34 +260,55 @@ final class Bluetooth: NSObject, ObservableObject {
         }
     }
 
+    func cancelSend() {
+        guard let sender, let link = links[sender], let transaction = link.transfer else { return }
+        transaction.cancelledByUser = true
+        disconnect(link)
+        central?.cancelPeripheralConnection(link.peripheral)
+        publishPeers()
+    }
+
     private func upload(_ encrypted: TemporaryFile, route: Wire, link: Link, transaction: Transaction) async throws {
         try expect(route, "route")
         if route.route == "lan" {
             do {
+                sendStage = .checkingLocalNetwork
                 let url = try await BulkNetwork.localURL(route.urls ?? [])
+                sendStage = .localUpload
                 try await BulkNetwork.uploadLocal(url, file: encrypted) { [weak self] value in
-                    guard link.transfer === transaction else { return }
-                    self?.progress = value
+                    guard let self, link.transfer === transaction, sendStage == .localUpload else { return }
+                    updateUploadProgress(value)
                 }
-                progress = 0.95
+                progress = Self.deliveryConfirmationPoint
                 return
             } catch {
                 try Task.checkCancellation()
+                sendStage = .requestingOneDriveLink
+                progress = 0
                 try await transmit(Wire(type: "fallback", id: transaction.id), on: link)
                 let next = try await transaction.next()
                 try expect(next, "route")
                 guard next.route == "cloud" else { throw TransferError.invalid }
-                try await BulkNetwork.uploadCloud(BulkNetwork.cloudURL(next), file: encrypted) { [weak self] in
-                    self?.progress = $0
-                }
+                try await uploadToOneDrive(encrypted, route: next, link: link, transaction: transaction)
             }
         } else if route.route == "cloud" {
-            try await BulkNetwork.uploadCloud(BulkNetwork.cloudURL(route), file: encrypted) { [weak self] in
-                self?.progress = $0
-            }
+            try await uploadToOneDrive(encrypted, route: route, link: link, transaction: transaction)
         } else {
             throw TransferError.invalid
         }
+    }
+
+    private func uploadToOneDrive(_ encrypted: TemporaryFile, route: Wire, link: Link, transaction: Transaction) async throws {
+        let url = try BulkNetwork.cloudURL(route)
+        sendStage = .oneDriveUpload
+        try await BulkNetwork.uploadCloud(url, file: encrypted) { [weak self] value in
+            guard let self, link.transfer === transaction, sendStage == .oneDriveUpload else { return }
+            updateUploadProgress(value)
+        }
+    }
+
+    private func updateUploadProgress(_ value: Double) {
+        progress = max(progress ?? 0, value * Self.deliveryConfirmationPoint)
     }
 
     private func receive(_ offer: Wire, on link: Link) {
