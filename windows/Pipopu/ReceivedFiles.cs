@@ -4,6 +4,7 @@ using Microsoft.Win32;
 namespace Pipopu;
 
 internal sealed record OneDriveFolder(string DriveId, string Id, string Path);
+internal sealed record ReceivedSaveResult(string Message, string? LocalPath = null);
 
 internal sealed record ReceivedFileSettings(bool AutoSave, string LocalFolder, OneDriveFolder? CloudFolder)
 {
@@ -97,7 +98,7 @@ internal static class ReceivedFiles
         return leaf;
     }
 
-    internal static async Task<string> SaveAsync(
+    internal static async Task<ReceivedSaveResult> SaveAsync(
         Transfer transfer, ReceivedFileSettings settings, OneDrive oneDrive, CancellationToken cancellation)
     {
         try
@@ -107,15 +108,15 @@ internal static class ReceivedFiles
             if (settings.CloudFolder is { } cloud)
             {
                 await oneDrive.SaveReceivedAsync(cloud, name, source, transfer.Size, cancellation);
-                return "Saved to OneDrive.";
+                return new("Saved to OneDrive.");
             }
 
-            await SaveLocalAsync(settings.LocalFolder, name, source, cancellation);
-            return "Saved automatically.";
+            string localPath = await SaveLocalAsync(settings.LocalFolder, name, source, cancellation);
+            return new("Saved automatically.", localPath);
         }
         catch (Exception error)
         {
-            return error is OperationCanceledException ? "Automatic save cancelled." : $"Automatic save failed. {error.Message}";
+            return new(error is OperationCanceledException ? "Automatic save cancelled." : $"Automatic save failed. {error.Message}");
         }
     }
 
@@ -161,7 +162,7 @@ internal static class ReceivedFiles
         }
     }
 
-    internal static void Release(Transfer transfer, Task<string>? save)
+    internal static void Release(Transfer transfer, Task<ReceivedSaveResult>? save)
     {
         if (transfer.File is not { } file)
             return;

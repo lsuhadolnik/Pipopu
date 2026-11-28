@@ -61,7 +61,7 @@ internal static class Program
 
 internal sealed class TrayApp : IDisposable
 {
-    private sealed record Receipt(Transfer Transfer, Task<string>? Save);
+    private sealed record Receipt(Transfer Transfer, Task<ReceivedSaveResult>? Save);
 
     private readonly Application app;
     private readonly BluetoothServer server = new();
@@ -132,7 +132,7 @@ internal sealed class TrayApp : IDisposable
         }
         var preferences = settings.Current;
         var cancellation = lifetime.Token;
-        Task<string>? save = autoSave && preferences.AutoSave && (transfer.Kind is TransferKind.Image or TransferKind.File)
+        Task<ReceivedSaveResult>? save = autoSave && preferences.AutoSave && (transfer.Kind is TransferKind.Image or TransferKind.File)
             ? Task.Run(() => ReceivedFiles.SaveAsync(transfer, preferences, server.Cloud, cancellation))
             : null;
         receipts.Enqueue(new Receipt(transfer, save));

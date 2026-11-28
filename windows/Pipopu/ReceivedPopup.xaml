@@ -5,6 +5,16 @@
     Title="Pipopu · Received" Width="414" Height="342" Topmost="True" ShowInTaskbar="False"
     FontFamily="{DynamicResource BodyFont}" FontSize="14"
     Foreground="{DynamicResource TextFillColorPrimaryBrush}">
+  <local:FlyoutWindow.Resources>
+    <Style x:Key="ReceiptAction" TargetType="Button" BasedOn="{StaticResource QuietButton}">
+      <Setter Property="Width" Value="38" />
+      <Setter Property="Height" Value="36" />
+      <Setter Property="Margin" Value="3,0,0,0" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="FontFamily" Value="{StaticResource SymbolFont}" />
+      <Setter Property="FontSize" Value="17" />
+    </Style>
+  </local:FlyoutWindow.Resources>
   <Grid Margin="24,14,24,20">
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto" />
@@ -30,25 +40,20 @@
           </ControlTemplate>
         </TextBox.Template>
       </TextBox>
-      <Image x:Name="Preview" Stretch="Uniform" HorizontalAlignment="Left" Visibility="Collapsed"
-             AutomationProperties.Name="Received image" />
+      <DockPanel x:Name="ImageContent" Visibility="Collapsed" LastChildFill="True">
+        <TextBlock x:Name="ImageName" DockPanel.Dock="Bottom" Margin="0,8,0,0"
+                   TextTrimming="CharacterEllipsis" HorizontalAlignment="Center"
+                   Style="{DynamicResource SecondaryText}" />
+        <Image x:Name="Preview" Stretch="Uniform" AutomationProperties.Name="Received image" />
+      </DockPanel>
     </Grid>
     <DockPanel Grid.Row="3" LastChildFill="True">
       <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
-        <Button x:Name="CopyButton" Style="{DynamicResource AccentButtonStyle}" MinHeight="36"
-                Padding="15,5" Click="CopyClick">
-          <StackPanel Orientation="Horizontal">
-            <TextBlock Text="&#xE8C8;" FontFamily="{DynamicResource SymbolFont}" Margin="0,0,7,0" />
-            <TextBlock x:Name="CopyText" />
-          </StackPanel>
-        </Button>
-        <Button x:Name="SaveButton" Style="{DynamicResource AccentButtonStyle}" MinHeight="36"
-                Padding="15,5" AutomationProperties.Name="Save as…" Click="SaveClick">
-          <StackPanel Orientation="Horizontal">
-            <TextBlock Text="&#xE74E;" FontFamily="{DynamicResource SymbolFont}" Margin="0,0,7,0" />
-            <TextBlock Text="Save as…" />
-          </StackPanel>
-        </Button>
+        <Button x:Name="CopyButton" Style="{StaticResource ReceiptAction}" Content="&#xE8C8;" Click="CopyClick" />
+        <Button x:Name="OpenFolderButton" Style="{StaticResource ReceiptAction}" Content="&#xE838;"
+                ToolTip="Open folder" AutomationProperties.Name="Open folder" Visibility="Collapsed" Click="OpenFolderClick" />
+        <Button x:Name="SaveButton" Style="{StaticResource ReceiptAction}" Content="&#xE792;"
+                ToolTip="Save as…" AutomationProperties.Name="Save as…" Click="SaveClick" />
       </StackPanel>
       <TextBlock x:Name="Status" Style="{DynamicResource SecondaryText}" TextWrapping="Wrap"
                  AutomationProperties.LiveSetting="Polite" Margin="0,0,12,0" VerticalAlignment="Center" />

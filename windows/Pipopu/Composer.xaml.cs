@@ -208,11 +208,7 @@ internal partial class Composer : FlyoutWindow
             throw new InvalidDataException("The file exceeds the 5 GB limit.");
 
         string name = Path.GetFileName(path);
-        var kind = Path.GetExtension(name).ToLowerInvariant() switch
-        {
-            ".png" or ".jpg" or ".jpeg" or ".gif" or ".bmp" or ".tif" or ".tiff" or ".heic" or ".heif" or ".webp" => TransferKind.Image,
-            _ => TransferKind.File
-        };
+        var kind = Transfer.IsImageFileName(name) ? TransferKind.Image : TransferKind.File;
         if (input.Length > Transfer.Limit)
             SetAttachment(new(kind, name, [], new TransferFile(path, input.Length, owned: false)));
         else

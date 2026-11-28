@@ -17,6 +17,9 @@ internal sealed record Transfer(TransferKind Kind, string Name, byte[] Data, Tra
     internal Stream OpenRead() => File is null ? new MemoryStream(Data, writable: false) :
         System.IO.File.OpenRead(File.Path);
 
+    internal static bool IsImageFileName(string name) => Path.GetExtension(name).ToLowerInvariant() is
+        ".png" or ".jpg" or ".jpeg" or ".gif" or ".bmp" or ".tif" or ".tiff" or ".heic" or ".heif" or ".webp";
+
     internal static void Validate(Wire offer)
     {
         if (offer.Id is null || !Guid.TryParseExact(offer.Id, "N", out _) ||
