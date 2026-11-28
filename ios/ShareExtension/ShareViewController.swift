@@ -37,83 +37,26 @@ private struct ShareView: View {
     let close: () -> Void
     @State private var transfer: Transfer?
     @State private var error: String?
-    @State private var selectedPeer: UUID?
+    @State private var fileSend: FileSend?
     @State private var sendAttempt: UUID?
     @State private var finishedAttempt: UUID?
-    @State private var cloudSelected = false
     @ScaledMetric(relativeTo: .body) private var tileWidth = 102.0
 
     private let accent = Color(red: 0.48, green: 0.32, blue: 0.89)
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 26) {
-                    if let transfer {
-                        preview(transfer)
-                    } else if let error {
-                        Label(error, systemImage: "exclamationmark.circle")
-                            .foregroundStyle(.secondary)
+            if let fileSend {
+                FileSendView(file: fileSend, bluetooth: bluetooth, tint: accent) {
+                    if bluetooth.sendCompleted {
+                        close()
                     } else {
-                        ProgressView("Loading shared item…")
-                    }
-
-                    VStack(alignment: .leading, spacing: 18) {
-                        Text("Nearby devices").font(.headline)
-                            .accessibilityAddTraits(.isHeader)
-                        if bluetooth.peers.isEmpty {
-                            Label(bluetooth.state, systemImage: "dot.radiowaves.left.and.right")
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                                .frame(maxWidth: .infinity, minHeight: 100)
-                        } else {
-                            LazyVGrid(columns: [GridItem(.adaptive(minimum: tileWidth), spacing: 12)], spacing: 18) {
-                                ForEach(bluetooth.peers) { peer in peerButton(peer) }
-                            }
-                            .frame(maxWidth: bluetooth.peers.count < 3
-                                ? tileWidth * Double(bluetooth.peers.count) + 12 : .infinity)
-                            .frame(maxWidth: .infinity)
-                        }
-                        if let stage = bluetooth.sendStage {
-                            Text(stage.label)
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                            if let speed = bluetooth.uploadSpeedLabel {
-                                Label(speed, systemImage: "speedometer")
-                                    .font(.footnote.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                            }
-                            if let transfer, let bytes = bluetooth.uploadByteLabel(total: transfer.size) {
-                                Text(bytes).font(.footnote.monospacedDigit()).foregroundStyle(.secondary)
-                            }
-                        } else if let result = bluetooth.result, !bluetooth.sendCompleted {
-                            if let stage = bluetooth.sendFailureStage {
-                                Text(stage.label.trimmingCharacters(in: CharacterSet(charactersIn: "…")))
-                                    .font(.footnote.weight(.semibold))
-                            }
-                            Label(result, systemImage: "exclamationmark.circle")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                        }
-                        if let code = bluetooth.pairingCode {
-                            Text("Check code \(code) on the receiving device, then approve the pairing there.")
-                                .font(.footnote)
-                        }
+                        self.fileSend = nil
                     }
                 }
-                .padding(22)
-                .frame(maxWidth: 560)
-                .frame(maxWidth: .infinity)
-            }
-            .background(Color(uiColor: .systemGroupedBackground))
-            .navigationTitle("Pipopu")
-            .navigationBarTitleDisplayMode(.inline)
-            .tint(accent)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button(bluetooth.sendCompleted ? "Done" : "Cancel", action: close)
-                }
+                .toolbar(.hidden, for: .navigationBar)
+            } else {
+                devicePicker
             }
         }
         .sensoryFeedback(.impact(weight: .light), trigger: sendAttempt)
@@ -127,15 +70,54 @@ private struct ShareView: View {
         } message: { request in
             Text("Only trust \(request.name) if it shows code \(request.code).")
         }
-        .task(id: bluetooth.sendCompleted) {
-            guard bluetooth.sendCompleted else { return }
-            try? await Task.sleep(for: .milliseconds(400))
-            guard !Task.isCancelled else { return }
-            close()
-        }
         .task {
             do { transfer = try await loadTransfer() }
             catch { self.error = error.localizedDescription }
+        }
+    }
+
+    private var devicePicker: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 26) {
+                if let transfer {
+                    preview(transfer)
+                } else if let error {
+                    Label(error, systemImage: "exclamationmark.circle")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ProgressView("Loading shared item…")
+                }
+
+                VStack(alignment: .leading, spacing: 18) {
+                    Text("Nearby devices").font(.headline)
+                        .accessibilityAddTraits(.isHeader)
+                    if bluetooth.peers.isEmpty {
+                        Label(bluetooth.state, systemImage: "dot.radiowaves.left.and.right")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, minHeight: 100)
+                    } else {
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: tileWidth), spacing: 12)], spacing: 18) {
+                            ForEach(bluetooth.peers) { peer in peerButton(peer) }
+                        }
+                        .frame(maxWidth: bluetooth.peers.count < 3
+                            ? tileWidth * Double(bluetooth.peers.count) + 12 : .infinity)
+                        .frame(maxWidth: .infinity)
+                    }
+                }
+            }
+            .padding(22)
+            .frame(maxWidth: 560)
+            .frame(maxWidth: .infinity)
+        }
+        .background(Color(uiColor: .systemGroupedBackground))
+        .navigationTitle("Pipopu")
+        .navigationBarTitleDisplayMode(.inline)
+        .tint(accent)
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Cancel", action: close)
+            }
         }
     }
 
@@ -172,49 +154,26 @@ private struct ShareView: View {
     }
 
     private func peerButton(_ peer: Bluetooth.Peer) -> some View {
-        let isSelected = selectedPeer == peer.id
-        let progress = isSelected ? bluetooth.progress : nil
-        let delivered = isSelected && bluetooth.sendCompleted
-
-        return Button {
+        Button {
             send(to: peer, overCloud: false)
         } label: {
             VStack(spacing: 8) {
-                ZStack {
-                    Circle()
-                        .fill(LinearGradient(
-                            colors: [accent.opacity(0.20), accent.opacity(0.07)],
-                            startPoint: .topLeading, endPoint: .bottomTrailing
-                        ))
-                        .overlay {
-                            Circle().strokeBorder(accent.opacity(0.14), lineWidth: 1)
-                        }
-                    if let progress {
+                Image(systemName: "desktopcomputer")
+                    .font(.system(size: 25, weight: .medium))
+                    .foregroundStyle(accent)
+                    .frame(width: 70, height: 70)
+                    .background {
                         Circle()
-                            .trim(from: 0, to: progress)
-                            .stroke(accent, style: StrokeStyle(lineWidth: 3, lineCap: .round))
-                            .rotationEffect(.degrees(-90))
-                            .padding(2)
-                            .animation(.linear(duration: 0.12), value: progress)
-                        Text(progress, format: .percent.precision(.fractionLength(0)))
-                            .font(.caption.weight(.semibold).monospacedDigit())
-                    } else {
-                        Image(systemName: delivered ? "checkmark" : "desktopcomputer")
-                            .font(.system(size: 25, weight: .medium))
+                            .fill(LinearGradient(colors: [accent.opacity(0.20), accent.opacity(0.07)],
+                                                 startPoint: .topLeading, endPoint: .bottomTrailing))
+                            .overlay { Circle().strokeBorder(accent.opacity(0.14), lineWidth: 1) }
                     }
-                }
-                .frame(width: 70, height: 70)
-                .foregroundStyle(accent)
-                .accessibilityHidden(true)
-
+                    .accessibilityHidden(true)
                 Text(peer.name)
                     .font(.caption.weight(.semibold))
                     .multilineTextAlignment(.center)
                     .lineLimit(2, reservesSpace: true)
                     .foregroundStyle(.primary)
-                if delivered {
-                    Text(cloudSelected ? "Uploaded" : "Sent").font(.caption2).foregroundStyle(.secondary)
-                }
             }
             .frame(maxWidth: .infinity)
             .contentShape(Rectangle())
@@ -225,16 +184,14 @@ private struct ShareView: View {
                 Button("Send over cloud", systemImage: "icloud.and.arrow.up") { send(to: peer, overCloud: true) }
             }
         }
-        .disabled(transfer == nil || !peer.connected || bluetooth.progress != nil || bluetooth.sendCompleted)
-        .opacity(!isSelected && (bluetooth.progress != nil || bluetooth.sendCompleted) ? 0.55 : 1)
+        .disabled(transfer == nil || !peer.connected || bluetooth.sendStage != nil)
         .accessibilityLabel("Send to " + peer.name)
-        .accessibilityValue(progress?.formatted(.percent.precision(.fractionLength(0))) ?? (delivered ? "Sent" : ""))
     }
 
     private func send(to peer: Bluetooth.Peer, overCloud: Bool) {
-        guard let transfer else { return }
-        selectedPeer = peer.id
-        cloudSelected = overCloud
+        guard let transfer, fileSend == nil else { return }
+        fileSend = FileSend(name: transfer.kind == .text ? "Shared text" : transfer.name,
+                            size: transfer.size, recipient: peer.name)
         let attempt = UUID()
         sendAttempt = attempt
         bluetooth.send(transfer, to: peer.id, overCloud: overCloud) { [finishedAttempt = $finishedAttempt] in
