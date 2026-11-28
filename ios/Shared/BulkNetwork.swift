@@ -137,6 +137,7 @@ enum BulkNetwork {
         let source = try FileHandle(forReadingFrom: file.url)
         defer { try? source.close() }
         var offset: Int64 = 0
+        var retries = 0
         while offset < file.size {
             try Task.checkCancellation()
             let count = Int(min(10 * 320 * 1024, file.size - offset))
@@ -150,9 +151,11 @@ enum BulkNetwork {
             let observer = TransferRoutes(cloud: true) { fraction in
                 progress((Double(start) + Double(count) * fraction) / Double(file.size))
             }
+            let data: Data
             let response: URLResponse
             do {
-                let (_, reply) = try await client.upload(for: request, from: bytes, delegate: observer)
+                let (body, reply) = try await client.upload(for: request, from: bytes, delegate: observer)
+                data = body
                 response = reply
             } catch let error as URLError where error.code != .cancelled {
                 let reason: String
@@ -168,10 +171,24 @@ enum BulkNetwork {
             }
             let code = status(response)
             guard end < file.size ? code == 202 : code == 200 || code == 201 else {
+                let conflict = code == 409 && (try? JSONDecoder().decode(UploadError.self, from: data))?
+                    .error.code.lowercased() == "namealreadyexists"
+                if (code == 409 || code == 416), !conflict, retries < 3 {
+                    retries += 1
+                    try await Task.sleep(for: .seconds(1 << (retries - 1)))
+                    if let serverOffset = try await uploadOffset(url, client: client),
+                       serverOffset >= 0, serverOffset <= end, serverOffset < file.size {
+                        offset = serverOffset
+                    }
+                    try source.seek(toOffset: UInt64(offset))
+                    continue
+                }
                 let reason: String
                 switch code {
                 case 401, 403: reason = "OneDrive refused access to this upload link."
                 case 404, 410: reason = "The OneDrive upload session is missing or has expired."
+                case 409 where conflict: reason = "OneDrive reported a filename conflict while finalizing the upload. Send again to create a new upload session."
+                case 409, 416: reason = "OneDrive could not reconcile the uploaded file ranges after retrying. Send again to create a new upload session."
                 case 429: reason = "OneDrive is limiting upload requests. Try again shortly."
                 case 507: reason = "The receiving OneDrive account is out of storage."
                 default: reason = "OneDrive rejected part of the file."
@@ -180,6 +197,31 @@ enum BulkNetwork {
             }
             offset = end
             await progress(Double(offset) / Double(file.size))
+        }
+    }
+
+    private struct UploadError: Decodable {
+        struct Detail: Decodable { let code: String }
+        let error: Detail
+    }
+
+    private struct UploadStatus: Decodable { let nextExpectedRanges: [String] }
+
+    private static func uploadOffset(_ url: URL, client: URLSession) async throws -> Int64? {
+        do {
+            let (data, response) = try await client.data(from: url)
+            if [404, 410].contains(status(response)) {
+                throw TransferError.message("The OneDrive upload session expired while retrying. Send again to start a new session.")
+            }
+            guard status(response) == 200,
+                  let session = try? JSONDecoder().decode(UploadStatus.self, from: data) else { return nil }
+            return session.nextExpectedRanges.compactMap { range -> Int64? in
+                guard let dash = range.firstIndex(of: "-"), let offset = Int64(range[..<dash]), offset >= 0 else { return nil }
+                return offset
+            }.min()
+        } catch is URLError {
+            try Task.checkCancellation()
+            return nil
         }
     }
 

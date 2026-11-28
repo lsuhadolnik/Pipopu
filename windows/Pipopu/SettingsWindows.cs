@@ -183,8 +183,12 @@ internal static class SettingsWindows
         };
         signOut.Click += async (_, _) =>
         {
-            await service.SignOutAsync();
-            cloudStatus.Text = "Signed out.";
+            try
+            {
+                await service.SignOutAsync();
+                cloudStatus.Text = "Signed out.";
+            }
+            catch (IOException error) { cloudStatus.Text = error.Message; }
             Refresh();
         };
         window.Closed += (_, _) => lifetime.Cancel();

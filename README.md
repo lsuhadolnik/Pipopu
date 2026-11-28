@@ -49,7 +49,7 @@ Install this version on both devices. When either side sends to a new device, co
 
 For large files, Pipopu on Windows starts a temporary HTTP endpoint on an active private IPv4 address. The Apple device probes it to see if the two devices can communicate. This works with Windows on Ethernet as well as Wi-Fi if the devices can reach each other. If Windows Firewall prompts, allow Pipopu on the private network. Pipopu encrypts file data before making it available over HTTP or OneDrive.
 
-To use OneDrive when the local endpoint is unreachable, open **Settings** from the Windows tray menu and select **Sign in to OneDrive**. Copy the displayed code and complete Microsoft sign-in. Pipopu uses its built-in public client ID and delegated Microsoft Graph **Files.ReadWrite** permission. The sign-in session stays in memory, so sign in again after restarting Pipopu.
+To use OneDrive when the local endpoint is unreachable, open **Settings** from the Windows tray menu and select **Sign in to OneDrive**. Copy the displayed code and complete Microsoft sign-in. Pipopu uses its built-in public client ID and delegated Microsoft Graph **Files.ReadWrite** permission. Windows encrypts the saved refresh token for your Windows user so Pipopu can renew the session after a restart. **Sign out** removes it.
 
 The sign-in code is copied automatically. Use **Copy code** to copy it again.
 
@@ -67,7 +67,7 @@ On iOS, turn on **Save received files automatically** under **Receiving**. Files
 
 Use **Send securely** in a device's send options to send text directly from the clipboard without previewing it. The receiver sees a **Copy secure text** button. Secure text uses the authenticated Bluetooth connection and stays out of the deferred cloud queue.
 
-**Send over cloud** queues an encrypted OneDrive transfer even when local networking is available. The receiver can close Pipopu after pairing or after an upload session has been issued. Check **Cloud transfers** in the Windows tray menu or in the iOS app later. iOS reconnects to the paired device over Bluetooth to refresh status and request a fresh OneDrive download link. On Windows, sign in again after restarting the app to resume queued work.
+**Send over cloud** queues an encrypted OneDrive transfer even when local networking is available. The receiver can close Pipopu after pairing or after an upload session has been issued. Check **Cloud transfers** in the Windows tray menu or in the iOS app later. iOS reconnects to the paired device over Bluetooth to refresh status and request a fresh OneDrive download link.
 
 For large incoming files, the Windows flyout shows the filename, transfer stage, and measured speed while data is moving. Choose a file on the iPhone to see its upload speed on the dedicated transfer screen. OneDrive reports remote upload progress after it accepts each fragment, so that estimate updates less often than the speed of a local transfer.
 

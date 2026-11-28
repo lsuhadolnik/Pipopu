@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -25,11 +26,32 @@ internal sealed class OneDrive
         Timeout = Timeout.InfiniteTimeSpan
     };
     private readonly SemaphoreSlim authentication = new(1);
+    private readonly string tokenPath;
     private string? access;
     private string? refresh;
     private DateTimeOffset expires;
 
-    internal bool IsSignedIn => Volatile.Read(ref access) is not null;
+    internal OneDrive(string? tokenPath = null)
+    {
+        this.tokenPath = tokenPath ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Pipopu", "onedrive-token");
+        try
+        {
+            if (!File.Exists(this.tokenPath))
+                return;
+            byte[] clear = ProtectedData.Unprotect(File.ReadAllBytes(this.tokenPath), null, DataProtectionScope.CurrentUser);
+            try { refresh = Encoding.UTF8.GetString(clear); }
+            finally { CryptographicOperations.ZeroMemory(clear); }
+            if (string.IsNullOrWhiteSpace(refresh))
+                refresh = null;
+        }
+        catch (Exception error) when (IsCacheError(error))
+        {
+            TransferLog.Write($"OneDrive token cache could not be read reason={error.GetType().Name}");
+        }
+    }
+
+    internal bool IsSignedIn => Volatile.Read(ref access) is not null || Volatile.Read(ref refresh) is not null;
 
     internal void RequireSignIn()
     {
@@ -64,8 +86,7 @@ internal sealed class OneDrive
                     case "slow_down": interval += TimeSpan.FromSeconds(5); continue;
                     case not null: throw new IOException("Microsoft did not authorize OneDrive access.");
                     default:
-                        refresh = null;
-                        SetToken(reply.RootElement);
+                        SetToken(reply.RootElement, newLogin: true);
                         TransferLog.Write("OneDrive sign-in succeeded");
                         return;
                 }
@@ -79,6 +100,12 @@ internal sealed class OneDrive
         await authentication.WaitAsync();
         try
         {
+            try { DeleteRefreshToken(); }
+            catch (DirectoryNotFoundException) { }
+            catch (Exception error) when (IsCacheError(error))
+            {
+                throw new IOException("Pipopu could not remove the saved OneDrive session. Try signing out again.", error);
+            }
             access = refresh = null;
             TransferLog.Write("OneDrive signed out");
         }
@@ -88,7 +115,8 @@ internal sealed class OneDrive
     internal async Task<Uri> CreateUploadAsync(string id, CancellationToken cancellation)
     {
         RequireSignIn();
-        var url = await CreateUploadAsync(Item(id), """{"item":{"@microsoft.graph.conflictBehavior":"fail"}}""", cancellation);
+        // The staging path is derived from this transfer's ID and must stay stable for downloads and cleanup.
+        var url = await CreateUploadAsync(Item(id), """{"item":{"@microsoft.graph.conflictBehavior":"replace"}}""", cancellation);
         TransferLog.Write($"OneDrive upload link created id={id} host={TransferLog.Host(url)}");
         return url;
     }
@@ -125,6 +153,8 @@ internal sealed class OneDrive
         Action<long>? bytesMoved = null)
     {
         var block = new byte[UploadBlock];
+        int retries = 0;
+        long start = input.CanSeek ? input.Position : 0;
         for (long offset = 0; offset < size;)
         {
             int count = (int)Math.Min(block.Length, size - offset);
@@ -132,13 +162,53 @@ internal sealed class OneDrive
             using var request = new HttpRequestMessage(HttpMethod.Put, url) { Content = new ByteArrayContent(block, 0, count) };
             request.Content.Headers.ContentRange = new ContentRangeHeaderValue(offset, offset + count - 1, size);
             using var response = await Http.SendAsync(request, cancellation);
-            offset += count;
-            if (offset < size ? response.StatusCode != HttpStatusCode.Accepted :
+            long end = offset + count;
+            if (end < size ? response.StatusCode != HttpStatusCode.Accepted :
                 response.StatusCode is not (HttpStatusCode.OK or HttpStatusCode.Created))
-                throw new IOException($"OneDrive upload failed ({(int)response.StatusCode}).");
+            {
+                bool conflict = response.StatusCode == HttpStatusCode.Conflict &&
+                    await IsNameConflictAsync(response, cancellation);
+                bool rangeConflict = response.StatusCode is HttpStatusCode.Conflict or HttpStatusCode.RequestedRangeNotSatisfiable;
+                if (rangeConflict && !conflict && input.CanSeek && retries < 3)
+                {
+                    retries++;
+                    TransferLog.Write($"Retrying OneDrive upload fragment http={(int)response.StatusCode} attempt={retries}");
+                    await Task.Delay(TimeSpan.FromSeconds(1 << (retries - 1)), cancellation);
+                    using var check = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+                    check.CancelAfter(TimeSpan.FromSeconds(8));
+                    (bool Exists, long? Bytes) state = (true, null);
+                    try { state = await UploadStatusAsync(url, check.Token); }
+                    catch (Exception error) when (error is IOException or HttpRequestException or JsonException) { }
+                    catch (OperationCanceledException) when (!cancellation.IsCancellationRequested) { }
+                    if (!state.Exists)
+                        throw new IOException("The OneDrive upload session expired while retrying. Send again to start a new session.");
+                    if (state.Bytes is long next && next <= end && next < size)
+                        offset = next;
+                    input.Position = start + offset;
+                    continue;
+                }
+                string reason = conflict ? "OneDrive reported a filename conflict while finalizing the upload." :
+                    rangeConflict && retries > 0 ? "OneDrive could not reconcile the uploaded file ranges after retrying." :
+                    "OneDrive upload failed.";
+                throw new IOException($"{reason} (HTTP {(int)response.StatusCode})");
+            }
+            offset = end;
             progress?.Report((int)(90 * offset / size));
             bytesMoved?.Invoke(offset);
         }
+    }
+
+    private static async Task<bool> IsNameConflictAsync(HttpResponseMessage response, CancellationToken cancellation)
+    {
+        try
+        {
+            using var data = JsonDocument.Parse(await response.Content.ReadAsByteArrayAsync(cancellation));
+            return data.RootElement.ValueKind == JsonValueKind.Object &&
+                data.RootElement.TryGetProperty("error", out var details) && details.ValueKind == JsonValueKind.Object &&
+                details.TryGetProperty("code", out var code) && code.ValueKind == JsonValueKind.String &&
+                string.Equals(code.GetString(), "nameAlreadyExists", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (JsonException) { return false; }
     }
 
     internal async Task<OneDriveFolder> RootFolderAsync(CancellationToken cancellation)
@@ -376,20 +446,72 @@ internal sealed class OneDrive
             using var result = await PostAsync(Identity + "token", new()
             {
                 ["client_id"] = ClientId, ["scope"] = Scope, ["grant_type"] = "refresh_token", ["refresh_token"] = refresh
-            }, cancellation);
+            }, cancellation, allowError: true);
+            if (result.RootElement.TryGetProperty("error", out var error))
+            {
+                if (error.GetString() is "invalid_grant" or "interaction_required" or "login_required")
+                {
+                    access = refresh = null;
+                    try { DeleteRefreshToken(); }
+                    catch (Exception cacheError) when (IsCacheError(cacheError))
+                    {
+                        TransferLog.Write($"Expired OneDrive cache could not be removed reason={cacheError.GetType().Name}");
+                    }
+                    throw new OneDriveSignInRequiredException();
+                }
+                throw new IOException("OneDrive could not renew the saved sign-in. Try again shortly.");
+            }
             SetToken(result.RootElement);
             return access!;
         }
         finally { authentication.Release(); }
     }
 
-    private void SetToken(JsonElement token)
+    private void SetToken(JsonElement token, bool newLogin = false)
     {
-        expires = DateTimeOffset.UtcNow.AddSeconds(ReadNumber(token, "expires_in"));
-        access = ReadString(token, "access_token");
-        if (token.TryGetProperty("refresh_token", out var next))
-            refresh = next.GetString();
+        var nextExpiry = DateTimeOffset.UtcNow.AddSeconds(ReadNumber(token, "expires_in"));
+        string nextAccess = ReadString(token, "access_token");
+        string? nextRefresh = token.TryGetProperty("refresh_token", out var next) && next.ValueKind == JsonValueKind.String
+            ? next.GetString() : null;
+        if (!string.IsNullOrWhiteSpace(nextRefresh) && (newLogin || nextRefresh != refresh))
+        {
+            SaveRefreshToken(nextRefresh);
+            refresh = nextRefresh;
+        }
+        else if (newLogin && refresh is not null)
+        {
+            DeleteRefreshToken();
+            refresh = null;
+        }
+        expires = nextExpiry;
+        access = nextAccess;
     }
+
+    private void SaveRefreshToken(string token)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(tokenPath)!);
+        byte[] clear = Encoding.UTF8.GetBytes(token);
+        string staging = tokenPath + ".tmp";
+        try
+        {
+            File.WriteAllBytes(staging, ProtectedData.Protect(clear, null, DataProtectionScope.CurrentUser));
+            File.Move(staging, tokenPath, overwrite: true);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(clear);
+            File.Delete(staging);
+        }
+    }
+
+    private void DeleteRefreshToken()
+    {
+        File.Delete(tokenPath + ".tmp");
+        File.Delete(tokenPath);
+    }
+
+    private static bool IsCacheError(Exception error) =>
+        error is IOException or UnauthorizedAccessException or CryptographicException or System.Security.SecurityException;
 
     private static string ReadString(JsonElement value, string name) =>
         value.TryGetProperty(name, out var field) && field.ValueKind == JsonValueKind.String &&
