@@ -1,6 +1,5 @@
 using System.Windows;
 using System.Windows.Threading;
-using System.Diagnostics;
 using Forms = System.Windows.Forms;
 
 namespace Pipopu;
@@ -16,6 +15,7 @@ internal static class Program
         if (!firstInstance)
             return;
 
+        TransferLog.Write("Pipopu started");
         ApplicationConfiguration.Initialize();
         AppContext.SetSwitch("Switch.System.Windows.Appearance.DisableFluentThemeWindowBackdrop", true);
         var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
@@ -30,6 +30,7 @@ internal static class Program
 
         using var tray = new TrayApp(app);
         tray.ShowComposer();
+        tray.ShowFirstRunSetup();
         app.Run();
     }
 }
@@ -95,7 +96,11 @@ internal sealed class TrayApp : IDisposable
     private async Task CheckCloudAsync()
     {
         try { await server.Deferred.PumpAsync(lifetime.Token); }
-        catch (Exception error) { Debug.WriteLine(error); }
+        catch (Exception error)
+        {
+            if (!lifetime.IsCancellationRequested)
+                TransferLog.Write($"Cloud queue check failed reason={error.GetType().Name}");
+        }
     }
 
     private void QueueReceipt(Transfer transfer, bool autoSave)
@@ -174,6 +179,13 @@ internal sealed class TrayApp : IDisposable
         if (popup is not null)
             popup.Topmost = false;
         composer.Present();
+    }
+
+    internal void ShowFirstRunSetup()
+    {
+        if (settings.HasSeenOneDriveSetup())
+            return;
+        SettingsWindows.ShowOneDriveSetup(settings.MarkOneDriveSetupSeen, ShowSettings);
     }
 
     private void ShowSettings()

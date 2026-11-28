@@ -26,7 +26,8 @@ final class Bluetooth: NSObject, ObservableObject {
 
     enum SendStage: Equatable {
         case requestingTransfer, pairing, waitingForDevice, encryptingFile, requestingLink
-        case checkingLocalNetwork, requestingOneDriveLink, checkingOneDriveLink, bluetooth, localUpload, oneDriveUpload, confirming
+        case checkingLocalNetwork, requestingOneDriveLink, checkingOneDriveLink, oneDriveSetup
+        case bluetooth, localUpload, oneDriveUpload, confirming
 
         var label: String {
             switch self {
@@ -38,6 +39,7 @@ final class Bluetooth: NSObject, ObservableObject {
             case .checkingLocalNetwork: "Connecting over the local network…"
             case .requestingOneDriveLink: "Requesting a OneDrive upload link…"
             case .checkingOneDriveLink: "Checking the OneDrive upload link…"
+            case .oneDriveSetup: "OneDrive setup required"
             case .bluetooth: "Sending over Bluetooth…"
             case .localUpload: "Uploading over the local network…"
             case .oneDriveUpload: "Uploading to OneDrive…"
@@ -70,6 +72,7 @@ final class Bluetooth: NSObject, ObservableObject {
         private var iterator: AsyncThrowingStream<Wire, Error>.Iterator
         var deadline = Date().addingTimeInterval(120)
         var peerError: String?
+        var requiresOneDriveSetup = false
         var cancelledByUser = false
         var detached = false
 
@@ -120,6 +123,7 @@ final class Bluetooth: NSObject, ObservableObject {
     @Published private(set) var sendFailureStage: SendStage?
     @Published private(set) var sendQueued = false
     @Published private var uploadBytesPerSecond: Double?
+    @Published private var uploadedFraction = 0.0
     @Published private(set) var result: String?
     @Published private(set) var received: Transfer?
     @Published private(set) var receiveError: String?
@@ -153,6 +157,16 @@ final class Bluetooth: NSObject, ObservableObject {
         } ?? "Measuring speed…"
     }
 
+    func uploadByteLabel(total: Int64) -> String? {
+        guard sendStage == .localUpload || sendStage == .oneDriveUpload else { return nil }
+        let transferred = Int64(Double(total) * uploadedFraction)
+        let counter = ByteCountFormatter()
+        counter.countStyle = .file
+        counter.allowedUnits = total >= 1_000_000_000 ? .useGB : (total >= 1_000_000 ? .useMB : .useKB)
+        counter.allowsNonnumericFormatting = false
+        return "\(counter.string(fromByteCount: transferred)) / \(counter.string(fromByteCount: total))"
+    }
+
     private var central: CBCentralManager?
     private var links = [UUID: Link]()
     private var timer: Timer?
@@ -166,6 +180,7 @@ final class Bluetooth: NSObject, ObservableObject {
 
     func start(receivingAs name: String? = nil) {
         guard central == nil else { return }
+        BulkNetwork.startMonitoringLocalNetwork()
         do { identity = try TrustStore.identity() }
         catch { state = error.localizedDescription; return }
         receivingName = name
@@ -291,6 +306,7 @@ final class Bluetooth: NSObject, ObservableObject {
                     }
                     let cloudKey = overCloud ? SymmetricKey(size: .bits256) : nil
                     var cloudUploadURL: URL?
+                    var route: (url: URL, cloud: Bool)?
                     if let cloudKey {
                         sendStage = .requestingOneDriveLink
                         transaction.deadline = Date().addingTimeInterval(65)
@@ -302,6 +318,10 @@ final class Bluetooth: NSObject, ObservableObject {
                         finish(link, transaction)
                         sendStage = .checkingOneDriveLink
                         cloudUploadURL = try BulkNetwork.cloudURL(ticket, forUpload: true)
+                    } else {
+                        sendStage = .requestingLink
+                        let offeredRoute = try await transaction.next()
+                        route = try await prepareUploadRoute(offeredRoute, link: link, transaction: transaction)
                     }
                     sendStage = .encryptingFile
                     let input = try FileHandle(forReadingFrom: file.url)
@@ -317,12 +337,11 @@ final class Bluetooth: NSObject, ObservableObject {
                         }
                         sendCompleted = true
                         sendQueued = true
-                        result = "(link.peer.name) can collect the file when it’s back online."
+                        result = "\(link.peer.name) can collect the file when it’s back online."
                         refreshCloud()
                         return
                     }
-                    sendStage = .requestingLink
-                    let route = try await transaction.next()
+                    guard let route else { throw TransferError.message("No upload route was available.") }
                     try await upload(encrypted, route: route, link: link, transaction: transaction)
                     sendStage = .confirming
                     try await transmit(Wire(type: "uploaded", id: transaction.id), on: link)
@@ -337,7 +356,7 @@ final class Bluetooth: NSObject, ObservableObject {
                 sendCompleted = true
                 result = "Sent"
             } catch {
-                sendFailureStage = sendStage
+                sendFailureStage = transaction.requiresOneDriveSetup ? .oneDriveSetup : sendStage
                 result = transaction.cancelledByUser ? "Transfer canceled." : (transaction.peerError ?? error.localizedDescription)
                 if transaction.peerError == nil && (!Task.isCancelled || transaction.detached) && link.peer.connected {
                     if transaction.detached {
@@ -366,44 +385,62 @@ final class Bluetooth: NSObject, ObservableObject {
         publishPeers()
     }
 
-    private func upload(_ encrypted: TemporaryFile, route: Wire, link: Link, transaction: Transaction) async throws {
+    private func prepareUploadRoute(_ route: Wire, link: Link, transaction: Transaction) async throws
+        -> (url: URL, cloud: Bool) {
         try expect(route, "route")
         if route.route == "lan" {
+            sendStage = .checkingLocalNetwork
             do {
-                sendStage = .checkingLocalNetwork
-                let url = try await BulkNetwork.localURL(route.urls ?? [])
+                return (try await BulkNetwork.localURL(route.urls ?? []), false)
+            } catch {
+                try Task.checkCancellation()
+                return (try await requestCloudUploadLink(link: link, transaction: transaction), true)
+            }
+        }
+        guard route.route == "cloud" else {
+            throw TransferError.message("The receiving device offered an unsupported transfer route.")
+        }
+        sendStage = .checkingOneDriveLink
+        return (try BulkNetwork.cloudURL(route, forUpload: true), true)
+    }
+
+    private func requestCloudUploadLink(link: Link, transaction: Transaction) async throws -> URL {
+        sendStage = .requestingOneDriveLink
+        transaction.deadline = Date().addingTimeInterval(65)
+        uploadBytesPerSecond = nil
+        progress = 0
+        try await transmit(Wire(type: "fallback", id: transaction.id), on: link)
+        let next = try await transaction.next()
+        try expect(next, "route")
+        guard next.route == "cloud" else {
+            throw TransferError.message("The receiving device replied without a OneDrive upload route.")
+        }
+        transaction.deadline = Date().addingTimeInterval(7200)
+        sendStage = .checkingOneDriveLink
+        return try BulkNetwork.cloudURL(next, forUpload: true)
+    }
+
+    private func upload(_ encrypted: TemporaryFile, route: (url: URL, cloud: Bool),
+                        link: Link, transaction: Transaction) async throws {
+        if route.cloud {
+            try await uploadToOneDrive(encrypted, url: route.url, link: link, transaction: transaction)
+        } else {
+            do {
                 beginUpload(.localUpload)
-                try await BulkNetwork.uploadLocal(url, file: encrypted) { [weak self] value in
+                try await BulkNetwork.uploadLocal(route.url, file: encrypted) { [weak self] value in
                     guard let self, link.transfer === transaction, sendStage == .localUpload else { return }
                     updateUploadProgress(value, size: encrypted.size)
                 }
                 progress = Self.deliveryConfirmationPoint
-                return
             } catch {
                 try Task.checkCancellation()
-                sendStage = .requestingOneDriveLink
-                transaction.deadline = Date().addingTimeInterval(65)
-                uploadBytesPerSecond = nil
-                progress = 0
-                try await transmit(Wire(type: "fallback", id: transaction.id), on: link)
-                let next = try await transaction.next()
-                try expect(next, "route")
-                guard next.route == "cloud" else {
-                    throw TransferError.message("The receiving device replied without a OneDrive upload route.")
-                }
-                transaction.deadline = Date().addingTimeInterval(7200)
-                try await uploadToOneDrive(encrypted, route: next, link: link, transaction: transaction)
+                let url = try await requestCloudUploadLink(link: link, transaction: transaction)
+                try await uploadToOneDrive(encrypted, url: url, link: link, transaction: transaction)
             }
-        } else if route.route == "cloud" {
-            try await uploadToOneDrive(encrypted, route: route, link: link, transaction: transaction)
-        } else {
-            throw TransferError.message("The receiving device offered an unsupported transfer route.")
         }
     }
 
-    private func uploadToOneDrive(_ encrypted: TemporaryFile, route: Wire, link: Link, transaction: Transaction) async throws {
-        sendStage = .checkingOneDriveLink
-        let url = try BulkNetwork.cloudURL(route, forUpload: true)
+    private func uploadToOneDrive(_ encrypted: TemporaryFile, url: URL, link: Link, transaction: Transaction) async throws {
         beginUpload(.oneDriveUpload)
         try await BulkNetwork.uploadCloud(url, file: encrypted) { [weak self] value in
             guard let self, link.transfer === transaction, sendStage == .oneDriveUpload else { return }
@@ -414,11 +451,13 @@ final class Bluetooth: NSObject, ObservableObject {
     private func beginUpload(_ stage: SendStage) {
         sendStage = stage
         uploadBytesPerSecond = nil
+        uploadedFraction = 0
         uploadSample = (ProcessInfo.processInfo.systemUptime, 0)
     }
 
     private func updateUploadProgress(_ value: Double, size: Int64) {
-        progress = max(progress ?? 0, value * Self.deliveryConfirmationPoint)
+        uploadedFraction = max(uploadedFraction, min(1, max(0, value)))
+        progress = max(progress ?? 0, uploadedFraction * Self.deliveryConfirmationPoint)
         let now = ProcessInfo.processInfo.systemUptime
         let bytes = min(1, max(0, value)) * Double(size)
         if let sample = uploadSample, bytes > sample.bytes,
@@ -781,6 +820,7 @@ final class Bluetooth: NSObject, ObservableObject {
                     let failure = message.type == "cancel" ? "The other device cancelled the transfer." :
                         message.error ?? "The other device declined the transfer."
                     transaction.peerError = failure
+                    transaction.requiresOneDriveSetup = message.route == "cloud-sign-in-required"
                     transaction.incoming.finish(throwing: TransferError.message(failure))
                     link.task?.cancel()
                     if confirmation?.0 === link { answerPairing(false) }

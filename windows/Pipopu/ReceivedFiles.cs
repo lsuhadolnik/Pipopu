@@ -14,8 +14,36 @@ internal sealed class SettingsStore
 {
     private const string RegistryPath = @"Software\Pipopu";
     private const string Value = "ReceivedFileSettings";
+    private const string SetupSeen = "OneDriveSetupSeen";
 
     internal ReceivedFileSettings Current { get; private set; } = Load();
+
+    internal bool HasSeenOneDriveSetup()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(RegistryPath);
+            return key?.GetValue(SetupSeen) is int seen && seen != 0;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            TransferLog.Write($"Could not read Windows setup preference reason={error.GetType().Name}");
+            return false;
+        }
+    }
+
+    internal void MarkOneDriveSetupSeen()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.CreateSubKey(RegistryPath);
+            key.SetValue(SetupSeen, 1);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            TransferLog.Write($"Could not save Windows setup preference reason={error.GetType().Name}");
+        }
+    }
 
     internal void Update(ReceivedFileSettings settings)
     {

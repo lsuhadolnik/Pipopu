@@ -216,8 +216,8 @@ internal sealed class BluetoothServer : IDisposable
                 throw new IOException("The selected device is disconnected or busy.");
             if ((transfer.Secure || overCloud) && link.Version < WireProtocol.CloudAndSecure)
                 throw new IOException("Update Pipopu on the other device to use secure text or queued cloud sending.");
-            if (overCloud && !Cloud.IsSignedIn)
-                throw new IOException("Sign in to OneDrive in Pipopu Settings before sending over cloud.");
+            if (overCloud)
+                Cloud.RequireSignIn();
             link.Active = transaction;
         }
 
@@ -225,6 +225,9 @@ internal sealed class BluetoothServer : IDisposable
         var token = transaction.Lifetime.Token;
         string id = transaction.Id;
         bool pair = !Trust.Contains(link.Session.Identity);
+        bool bulk = overCloud || transfer.Size > Transfer.Limit;
+        if (bulk)
+            TransferLog.Write($"Send started id={id} bytes={transfer.Size} cloudRequested={overCloud}");
         try
         {
             var offer = new Wire("offer", id, transfer.Name, (int)transfer.Kind, transfer.Size, pair,
@@ -251,6 +254,7 @@ internal sealed class BluetoothServer : IDisposable
             {
                 Release(link, transaction);
                 await Deferred.EnqueueAsync(id, link.Session.Identity, link.Name, transfer, cancellation);
+                TransferLog.Write($"Send queued id={id}");
                 return;
             }
 
@@ -275,6 +279,8 @@ internal sealed class BluetoothServer : IDisposable
                 if (!await TryLanAsync(link, transaction, encrypted, upload: false, progress,
                     bytes => network.Update("Sending over local network", bytes)))
                 {
+                    TransferLog.Write($"Send falling back to OneDrive id={id}");
+                    Cloud.RequireSignIn();
                     Uri? session = null;
                     try
                     {
@@ -292,13 +298,18 @@ internal sealed class BluetoothServer : IDisposable
                 }
                 network.Finish();
             }
+            if (bulk)
+                TransferLog.Write($"Send completed id={id}");
         }
         catch (Exception error)
         {
+            if (bulk)
+                TransferLog.Write($"Send failed id={id} reason={error.GetType().Name} peerReported={transaction.PeerError is not null}");
             if (transaction.PeerError is { } message)
                 throw new IOException(message, error);
             await ReplyBestEffortAsync(link, new Wire(cancellation.IsCancellationRequested ? "cancel" : "fail",
-                id, Error: error.Message));
+                id, Route: error is OneDriveSignInRequiredException ? OneDriveSignInRequiredException.Route : null,
+                Error: error.Message));
             throw;
         }
         finally
@@ -318,11 +329,16 @@ internal sealed class BluetoothServer : IDisposable
             TransferFile? received = null;
             TransferProgressReporter? incoming = null;
             bool queued = false;
+            bool bulk = offer.Size > Transfer.Limit || offer.Route == "cloud-deferred";
             try
             {
                 Transfer.Validate(offer);
                 if ((offer.Secure || offer.Route == "cloud-deferred") && link.Version < WireProtocol.CloudAndSecure)
                     throw new IOException("This transfer requires a newer version of Pipopu.");
+                if (bulk)
+                    TransferLog.Write($"Receive started id={id} bytes={offer.Size} cloudRequested={offer.Route == "cloud-deferred"}");
+                if (offer.Route == "cloud-deferred")
+                    Cloud.RequireSignIn();
                 bool pair = !Trust.Contains(link.Session.Identity) || offer.Pair;
                 await SendPacketAsync(link, new Wire("review", id, Pair: pair), token);
                 if (pair)
@@ -333,7 +349,7 @@ internal sealed class BluetoothServer : IDisposable
                 if (pair)
                     Trust.Remember(link.Session.Identity, link.Name);
 
-                if (offer.Size > Transfer.Limit || offer.Route == "cloud-deferred")
+                if (bulk)
                     incoming = new TransferProgressReporter(id, string.IsNullOrWhiteSpace(offer.Name) ? "Incoming message" : offer.Name,
                         FileCipher.EncryptedSize(offer.Size), value => IncomingTransferProgress?.Invoke(value));
 
@@ -348,6 +364,7 @@ internal sealed class BluetoothServer : IDisposable
                     queued = true;
                     Deferred.TrackIncoming(id, incoming);
                     await SendPacketAsync(link, new Wire("cloud-upload", id, Urls: [upload.AbsoluteUri], Route: "cloud"), token);
+                    TransferLog.Write($"Receive cloud ticket sent id={id}");
                     return;
                 }
 
@@ -377,6 +394,8 @@ internal sealed class BluetoothServer : IDisposable
                     }
                     else
                     {
+                        TransferLog.Write($"Receive falling back to OneDrive id={id}");
+                        Cloud.RequireSignIn();
                         string cloudId = Guid.NewGuid().ToString("N");
                         Uri? session = null;
                         try
@@ -425,14 +444,19 @@ internal sealed class BluetoothServer : IDisposable
                 TransferReceived?.Invoke(transfer);
                 received = null;
                 await SendPacketAsync(link, new Wire("complete", id), token);
+                if (bulk)
+                    TransferLog.Write($"Receive completed id={id}");
             }
             catch (Exception error)
             {
+                if (bulk)
+                    TransferLog.Write($"Receive failed id={id} reason={error.GetType().Name} peerReported={transaction.PeerError is not null}");
                 if (!queued)
                     incoming?.Finish(transaction.PeerError ?? (error is OperationCanceledException or TimeoutException
                         ? "The sending device stopped responding." : error.Message));
                 if (transaction.PeerError is null)
-                    await ReplyBestEffortAsync(link, new Wire("fail", id, Error: error.Message));
+                    await ReplyBestEffortAsync(link, new Wire("fail", id, Error: error.Message,
+                        Route: error is OneDriveSignInRequiredException ? OneDriveSignInRequiredException.Route : null));
             }
             finally
             {

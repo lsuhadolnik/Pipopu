@@ -6,6 +6,12 @@ using System.Text.Json;
 
 namespace Pipopu;
 
+internal sealed class OneDriveSignInRequiredException() : IOException(
+    "Set up OneDrive in Pipopu Settings on the Windows device to transfer large files when the local network is unavailable.")
+{
+    internal const string Route = "cloud-sign-in-required";
+}
+
 internal sealed class OneDrive
 {
     private const string Identity = "https://login.microsoftonline.com/common/oauth2/v2.0/";
@@ -24,6 +30,12 @@ internal sealed class OneDrive
     private DateTimeOffset expires;
 
     internal bool IsSignedIn => Volatile.Read(ref access) is not null;
+
+    internal void RequireSignIn()
+    {
+        if (!IsSignedIn)
+            throw new OneDriveSignInRequiredException();
+    }
 
     internal async Task SignInAsync(Action<string, Uri> showCode, CancellationToken cancellation)
     {
@@ -54,6 +66,7 @@ internal sealed class OneDrive
                     default:
                         refresh = null;
                         SetToken(reply.RootElement);
+                        TransferLog.Write("OneDrive sign-in succeeded");
                         return;
                 }
             }
@@ -64,12 +77,21 @@ internal sealed class OneDrive
     internal async Task SignOutAsync()
     {
         await authentication.WaitAsync();
-        try { access = refresh = null; }
+        try
+        {
+            access = refresh = null;
+            TransferLog.Write("OneDrive signed out");
+        }
         finally { authentication.Release(); }
     }
 
     internal async Task<Uri> CreateUploadAsync(string id, CancellationToken cancellation)
-        => await CreateUploadAsync(Item(id), """{"item":{"@microsoft.graph.conflictBehavior":"fail"}}""", cancellation);
+    {
+        RequireSignIn();
+        var url = await CreateUploadAsync(Item(id), """{"item":{"@microsoft.graph.conflictBehavior":"fail"}}""", cancellation);
+        TransferLog.Write($"OneDrive upload link created id={id} host={TransferLog.Host(url)}");
+        return url;
+    }
 
     private async Task<Uri> CreateUploadAsync(string path, string options, CancellationToken cancellation)
     {
@@ -210,7 +232,12 @@ internal sealed class OneDrive
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", await TokenAsync(cancellation));
         using var response = await GraphRedirects.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellation);
         if (response.StatusCode == HttpStatusCode.Found && response.Headers.Location is { IsAbsoluteUri: true } location)
-            return Https(location.AbsoluteUri);
+        {
+            var url = Https(location.AbsoluteUri);
+            TransferLog.Write($"OneDrive download link issued id={id} host={TransferLog.Host(url)}");
+            return url;
+        }
+        TransferLog.Write($"OneDrive download link missing id={id} http={(int)response.StatusCode}");
         throw new IOException($"OneDrive did not provide a download link for the staged file (HTTP {(int)response.StatusCode}).");
     }
 
@@ -319,6 +346,7 @@ internal sealed class OneDrive
         using var result = await Http.SendAsync(request, cancellation);
         if (!result.IsSuccessStatusCode && creatingUpload)
         {
+            TransferLog.Write($"OneDrive upload link request failed http={(int)result.StatusCode}");
             string reason = result.StatusCode switch
             {
                 HttpStatusCode.Unauthorized => "Sign in to OneDrive again on the device creating the link.",
@@ -344,7 +372,7 @@ internal sealed class OneDrive
             if (access is not null && expires > DateTimeOffset.UtcNow.AddMinutes(1))
                 return access;
             if (refresh is null)
-                throw new IOException("Sign in to OneDrive from Pipopu Settings to use the fallback.");
+                throw new OneDriveSignInRequiredException();
             using var result = await PostAsync(Identity + "token", new()
             {
                 ["client_id"] = ClientId, ["scope"] = Scope, ["grant_type"] = "refresh_token", ["refresh_token"] = refresh

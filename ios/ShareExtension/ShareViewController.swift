@@ -83,6 +83,9 @@ private struct ShareView: View {
                                     .font(.footnote.monospacedDigit())
                                     .foregroundStyle(.secondary)
                             }
+                            if let transfer, let bytes = bluetooth.uploadByteLabel(total: transfer.size) {
+                                Text(bytes).font(.footnote.monospacedDigit()).foregroundStyle(.secondary)
+                            }
                         } else if let result = bluetooth.result, !bluetooth.sendCompleted {
                             if let stage = bluetooth.sendFailureStage {
                                 Text(stage.label.trimmingCharacters(in: CharacterSet(charactersIn: "…")))

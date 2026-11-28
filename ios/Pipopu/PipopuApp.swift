@@ -719,10 +719,20 @@ private struct FileSendView: View {
             Text(title)
                 .font(.title3.weight(.semibold))
                 .accessibilityAddTraits(.isHeader)
-            if !cancelling, let speed = bluetooth.uploadSpeedLabel {
-                Label(speed, systemImage: "speedometer")
-                    .font(.subheadline.monospacedDigit())
-                    .foregroundStyle(.secondary)
+            if !cancelling, let speed = bluetooth.uploadSpeedLabel,
+               let bytes = bluetooth.uploadByteLabel(total: file.size) {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 12) {
+                        Label(speed, systemImage: "speedometer")
+                        Text(bytes)
+                    }
+                    VStack(spacing: 4) {
+                        Label(speed, systemImage: "speedometer")
+                        Text(bytes)
+                    }
+                }
+                .font(.subheadline.monospacedDigit())
+                .foregroundStyle(.secondary)
             }
             if bluetooth.sendStage == .pairing, let code = bluetooth.pairingCode {
                 Text(code).font(.title3.monospacedDigit()).textSelection(.enabled)

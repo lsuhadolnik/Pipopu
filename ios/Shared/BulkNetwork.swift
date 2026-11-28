@@ -1,4 +1,24 @@
 import Foundation
+import Network
+
+private final class LocalNetworkPath: @unchecked Sendable {
+    static let shared = LocalNetworkPath()
+    private let monitor = NWPathMonitor()
+    private let lock = NSLock()
+    private var available: Bool?
+
+    private init() {
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            let local = path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet) ||
+                path.availableInterfaces.contains { $0.type == .wifi || $0.type == .wiredEthernet }
+            lock.withLock { available = local }
+        }
+        monitor.start(queue: DispatchQueue(label: "Pipopu.LocalNetworkPath"))
+    }
+
+    var canTryLocalNetwork: Bool { lock.withLock { available != false } }
+}
 
 private final class TransferRoutes: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     let cloud: Bool
@@ -12,8 +32,10 @@ private final class TransferRoutes: NSObject, URLSessionTaskDelegate, @unchecked
     static func valid(_ url: URL, cloud: Bool) -> Bool {
         guard url.user == nil, url.password == nil, let host = url.host?.lowercased() else { return false }
         if cloud {
-            let domains = ["1drv.com", "onedrive.com", "sharepoint.com", "sharepoint-df.com", "live.com"]
-            return url.scheme == "https" && domains.contains { host == $0 || host.hasSuffix("." + $0) }
+            let domains = ["1drv.com", "onedrive.com", "sharepoint.com", "sharepoint-df.com", "live.com",
+                           "microsoftpersonalcontent.com"]
+            return url.scheme == "https" && (url.port == nil || url.port == 443) &&
+                domains.contains { host == $0 || host.hasSuffix("." + $0) }
         }
         let parts = host.split(separator: ".", omittingEmptySubsequences: false)
         let ip = parts.compactMap { UInt8($0) }
@@ -38,6 +60,8 @@ private final class TransferRoutes: NSObject, URLSessionTaskDelegate, @unchecked
 }
 
 enum BulkNetwork {
+    static func startMonitoringLocalNetwork() { _ = LocalNetworkPath.shared }
+
     private static func session(cloud: Bool, timeout: TimeInterval = 30,
                                 progress: (@MainActor (Double) -> Void)? = nil) -> URLSession {
         let options = URLSessionConfiguration.ephemeral
@@ -49,6 +73,9 @@ enum BulkNetwork {
     }
 
     static func localURL(_ candidates: [String]) async throws -> URL {
+        guard LocalNetworkPath.shared.canTryLocalNetwork else {
+            throw TransferError.message("Connect this device to Wi-Fi or Ethernet to use local transfers.")
+        }
         let probe = session(cloud: false, timeout: 2.5)
         defer { probe.finishTasksAndInvalidate() }
         for item in candidates.prefix(8) {

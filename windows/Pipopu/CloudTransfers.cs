@@ -66,8 +66,7 @@ internal sealed class CloudTransfers(OneDrive oneDrive, string? directory = null
     {
         if (transfer.Size <= 0)
             throw new IOException("Choose a nonempty file or message for cloud delivery.");
-        if (!oneDrive.IsSignedIn)
-            throw new IOException("Sign in to OneDrive in Pipopu Settings before sending over cloud.");
+        oneDrive.RequireSignIn();
 
         string drive = await oneDrive.DriveIdAsync(cancellation);
         byte[] key = RandomNumberGenerator.GetBytes(32);
@@ -94,6 +93,7 @@ internal sealed class CloudTransfers(OneDrive oneDrive, string? directory = null
     {
         if (key.Length != 32 || offer.Size <= 0)
             throw new InvalidDataException("Invalid cloud file.");
+        oneDrive.RequireSignIn();
         string id = offer.Id!;
         string drive = await oneDrive.DriveIdAsync(cancellation);
         lock (gate)
@@ -139,6 +139,7 @@ internal sealed class CloudTransfers(OneDrive oneDrive, string? directory = null
         {
             if (Jobs.GetValueOrDefault(id) is { Outgoing: false, Status: Waiting } job && job.Identity == identity)
             {
+                TransferLog.Write($"Cloud uploader reported a failure id={id}");
                 string message = SafeError(error);
                 Put(job with { Error = message });
                 if (incoming.TryGetValue(id, out var progress))
@@ -207,6 +208,7 @@ internal sealed class CloudTransfers(OneDrive oneDrive, string? directory = null
         }
         catch (Exception error) when (!cancellation.IsCancellationRequested)
         {
+            TransferLog.Write($"Cloud transfer task failed id={snapshot.Id} reason={error.GetType().Name}");
             if (Find(snapshot.Id) is { Status: Queued or Uploading or Waiting } current)
             {
                 if (current.Status == Waiting && error is HttpRequestException)

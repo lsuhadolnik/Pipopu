@@ -53,6 +53,8 @@ To use OneDrive when the local endpoint is unreachable, open **Settings** from t
 
 The sign-in code is copied automatically. Use **Copy code** to copy it again.
 
+On Windows, **Settings → Open transfer logs** opens the local diagnostics folder. Logs rotate after 512 KiB and include transfer stages, HTTP status codes, and link hostnames. Signed links, sign-in codes, file names, and payloads stay out of the logs.
+
 Windows uses a temporary encrypted OneDrive item and sends its preauthenticated download URL over the secured BLE connection. When sending from Apple, Windows creates a preauthenticated upload session and shares its URL over BLE. Apple uploads in order and reports completion, then Windows retrieves and verifies the file before acknowledging it. Windows removes its temporary OneDrive items after the transfer when it can reach OneDrive.
 
 ## Saving received files
