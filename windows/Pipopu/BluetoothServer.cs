@@ -81,6 +81,28 @@ internal sealed class BluetoothServer : IDisposable
     private GattLocalCharacteristic? nameCharacteristic;
     private string deviceName = LoadDeviceName();
     private bool disposed;
+    private bool pausedForUpdate;
+
+    internal bool HasActiveTransfer
+    {
+        get { lock (gate) return links.Values.Any(link => link.Active is not null); }
+    }
+
+    internal bool TryPauseForUpdate()
+    {
+        lock (gate)
+        {
+            if (links.Values.Any(link => link.Active is not null))
+                return false;
+            pausedForUpdate = true;
+            return true;
+        }
+    }
+
+    internal void ResumeAfterUpdateFailure()
+    {
+        lock (gate) pausedForUpdate = false;
+    }
 
     internal event Action<Transfer>? TransferReceived;
     internal event Action<TransferProgress>? IncomingTransferProgress;
@@ -715,7 +737,7 @@ internal sealed class BluetoothServer : IDisposable
             }
             else if (message.Type == "offer" && message.Id is { } transferId && link.Name.Length > 0)
             {
-                if (link.Active is null && links.Values.Count(peer => peer.Active is not null) < 4)
+                if (!pausedForUpdate && link.Active is null && links.Values.Count(peer => peer.Active is not null) < 4)
                     link.Active = inbound = new Transaction(transferId);
                 else
                     busy = true;

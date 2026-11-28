@@ -17,6 +17,24 @@ final class Bluetooth: NSObject, ObservableObject {
         var name: String
         var connected = false
         var supportsCloudAndSecure = false
+        var identity: String?
+    }
+
+    struct ActivityEvent: Sendable {
+        let id: String
+        let device: String
+        let deviceName: String
+        let transfer: Transfer
+        var outgoing = false
+        var queued = false
+    }
+
+    struct IncomingActivity: Equatable {
+        let id: String
+        let device: String
+        let deviceName: String
+        let name: String
+        var fraction: Double?
     }
 
     struct Pairing {
@@ -125,7 +143,8 @@ final class Bluetooth: NSObject, ObservableObject {
     @Published private var uploadBytesPerSecond: Double?
     @Published private var uploadedFraction = 0.0
     @Published private(set) var result: String?
-    @Published private(set) var received: Transfer?
+    let activityEvents = PassthroughSubject<ActivityEvent, Never>()
+    @Published private(set) var incomingActivity: [String: IncomingActivity] = [:]
     @Published private(set) var receiveError: String?
     @Published private(set) var sendCompleted = false
     @Published private(set) var pairing: Pairing?
@@ -206,8 +225,6 @@ final class Bluetooth: NSObject, ObservableObject {
         peers = []
         pairingCode = nil
     }
-
-    func clearReceived() { received = nil }
 
     func updateReceivingName(_ name: String?) {
         guard receivingName != name else { return }
@@ -337,6 +354,8 @@ final class Bluetooth: NSObject, ObservableObject {
                         }
                         sendCompleted = true
                         sendQueued = true
+                        activityEvents.send(ActivityEvent(id: transaction.id, device: session.identity,
+                            deviceName: link.peer.name, transfer: transfer, outgoing: true, queued: true))
                         result = "\(link.peer.name) can collect the file when it’s back online."
                         refreshCloud()
                         return
@@ -354,6 +373,8 @@ final class Bluetooth: NSObject, ObservableObject {
                 }
                 try expect(await transaction.next(), "complete")
                 sendCompleted = true
+                activityEvents.send(ActivityEvent(id: transaction.id, device: session.identity,
+                    deviceName: link.peer.name, transfer: transfer, outgoing: true))
                 result = "Sent"
             } catch {
                 sendFailureStage = transaction.requiresOneDriveSetup ? .oneDriveSetup : sendStage
@@ -482,10 +503,17 @@ final class Bluetooth: NSObject, ObservableObject {
 
         let transaction = Transaction(id: id)
         receiveError = nil
+        if offer.route != "cloud-deferred" {
+            incomingActivity[id] = IncomingActivity(id: id, device: session.identity, deviceName: link.peer.name,
+                name: kind == .text ? "Message" : name)
+        }
         link.transfer = transaction
         link.task = Task { [weak self] in
             guard let self else { return }
-            defer { finish(link, transaction) }
+            defer {
+                incomingActivity[id] = nil
+                finish(link, transaction)
+            }
             do {
                 if offer.secure == true && (!link.peer.supportsCloudAndSecure || kind != .text ||
                     size > Int64(Transfer.limit) || offer.route != nil) {
@@ -507,6 +535,7 @@ final class Bluetooth: NSObject, ObservableObject {
                     return
                 }
                 transaction.deadline = Date().addingTimeInterval(7200)
+                reportIncoming(id, 0)
                 let message = try await transaction.next()
                 let transfer: Transfer
                 if size <= Int64(Transfer.limit) {
@@ -528,7 +557,8 @@ final class Bluetooth: NSObject, ObservableObject {
                     }
                 }
                 try Task.checkCancellation()
-                received = transfer
+                reportIncoming(id, 1)
+                activityEvents.send(ActivityEvent(id: id, device: session.identity, deviceName: link.peer.name, transfer: transfer))
                 try await transmit(Wire(type: "complete", id: id), on: link)
             } catch {
                 receiveError = transaction.peerError ?? error.localizedDescription
@@ -539,23 +569,35 @@ final class Bluetooth: NSObject, ObservableObject {
         }
     }
 
+    private func reportIncoming(_ id: String, _ fraction: Double) {
+        guard let current = incomingActivity[id], current.fraction != fraction else { return }
+        incomingActivity[id]?.fraction = fraction
+    }
+
     private func download(_ route: Wire, link: Link, transaction: Transaction, size: Int64) async throws -> TemporaryFile {
         try expect(route, "route")
         if route.route == "lan" {
             do {
                 let url = try await BulkNetwork.localURL(route.urls ?? [])
-                return try await BulkNetwork.download(url, cloud: false, size: size)
+                return try await downloadFile(url, cloud: false, size: size, id: transaction.id)
             } catch {
                 try Task.checkCancellation()
                 try await transmit(Wire(type: "fallback", id: transaction.id), on: link)
                 let next = try await transaction.next()
                 try expect(next, "route")
                 guard next.route == "cloud" else { throw TransferError.invalid }
-                return try await BulkNetwork.download(BulkNetwork.cloudURL(next), cloud: true, size: size)
+                reportIncoming(transaction.id, 0)
+                return try await downloadFile(BulkNetwork.cloudURL(next), cloud: true, size: size, id: transaction.id)
             }
         }
         guard route.route == "cloud" else { throw TransferError.invalid }
-        return try await BulkNetwork.download(BulkNetwork.cloudURL(route), cloud: true, size: size)
+        return try await downloadFile(BulkNetwork.cloudURL(route), cloud: true, size: size, id: transaction.id)
+    }
+
+    private func downloadFile(_ url: URL, cloud: Bool, size: Int64, id: String) async throws -> TemporaryFile {
+        try await BulkNetwork.download(url, cloud: cloud, size: size) { [weak self] fraction in
+            self?.reportIncoming(id, fraction * 0.95)
+        }
     }
 
     private func expect(_ message: Wire, _ type: String) throws {
@@ -586,7 +628,11 @@ final class Bluetooth: NSObject, ObservableObject {
     func getCloudFile(_ notice: CloudNotice) {
         guard !notice.outgoing else { return }
         if hasCloudFile(notice) {
-            do { received = try CloudArchive.open(notice.id) }
+            guard let device = cloudByPeer.first(where: { $0.value.contains { $0.id == notice.id } })?.key else { return }
+            do {
+                activityEvents.send(ActivityEvent(id: notice.id, device: device, deviceName: notice.peer,
+                    transfer: try CloudArchive.open(notice.id)))
+            }
             catch { cloudStatus = error.localizedDescription }
             return
         }
@@ -639,6 +685,11 @@ final class Bluetooth: NSObject, ObservableObject {
             link.peer.id == downloadRequest?.peer:
             downloadingCloudFile = true
             Task {
+                defer {
+                    if let id = message.id { incomingActivity[id] = nil }
+                    downloadRequest = nil
+                    downloadingCloudFile = false
+                }
                 do {
                     guard let id = message.id, CloudArchive.valid(id), let key = message.data, key.count == 32,
                           let name = message.name, name.utf8.count <= 255,
@@ -648,21 +699,23 @@ final class Bluetooth: NSObject, ObservableObject {
                         throw TransferError.message("The other device returned an invalid cloud download ticket.")
                     }
                     cloudStatus = "Downloading from OneDrive…"
-                    let encrypted = try await BulkNetwork.download(BulkNetwork.cloudURL(message), cloud: true,
-                                                                  size: FileCipher.encryptedSize(size))
+                    incomingActivity[id] = IncomingActivity(id: id, device: identity, deviceName: link.peer.name,
+                        name: kind == .text ? "Message" : name, fraction: 0)
+                    let encrypted = try await downloadFile(BulkNetwork.cloudURL(message), cloud: true,
+                                                           size: FileCipher.encryptedSize(size), id: id)
                     let input = try FileHandle(forReadingFrom: encrypted.url)
                     defer { try? input.close() }
                     let clear = try await FileCipher.transform(input: input, size: size, key: SymmetricKey(data: key),
                                                               encrypt: false)
-                    received = try CloudArchive.save(clear, id: id, kind: kind, name: name)
+                    let transfer = try CloudArchive.save(clear, id: id, kind: kind, name: name)
+                    reportIncoming(id, 1)
+                    activityEvents.send(ActivityEvent(id: id, device: identity, deviceName: link.peer.name, transfer: transfer))
                     publishCloudNotices()
                     cloudStatus = "Downloaded."
                     if link.peer.connected {
                         try? await transmit(Wire(type: "cloud-delivered", id: id), on: link)
                     }
                 } catch { cloudStatus = error.localizedDescription }
-                downloadRequest = nil
-                downloadingCloudFile = false
             }
         default: break
         }
@@ -694,7 +747,11 @@ final class Bluetooth: NSObject, ObservableObject {
     }
 
     private func publishPeers() {
-        peers = links.values.map(\.peer).sorted {
+        peers = links.values.map { link in
+            var peer = link.peer
+            peer.identity = link.session?.identity
+            return peer
+        }.sorted {
             let order = $0.name.localizedStandardCompare($1.name)
             return order == .orderedSame ? $0.id.uuidString < $1.id.uuidString : order == .orderedAscending
         }
@@ -992,7 +1049,12 @@ extension Bluetooth: @preconcurrency CBPeripheralDelegate {
         do {
             switch opcode {
             case Frame.begin: link.incoming = try IncomingPacket(frame)
-            case Frame.chunk: try link.incoming?.append(frame)
+            case Frame.chunk:
+                try link.incoming?.append(frame)
+                if let id = link.transfer?.id, let packet = link.incoming, packet.length > 512 {
+                    let percent = (packet.fraction * 95).rounded(.down) / 100
+                    reportIncoming(id, percent)
+                }
             case Frame.end:
                 guard let packet = try link.incoming?.finish(frame) else {
                     throw TransferError.message("A Bluetooth message ended before Pipopu received its contents.")

@@ -1,4 +1,5 @@
 using System.Windows;
+using System.Windows.Input;
 using System.Windows.Threading;
 using Forms = System.Windows.Forms;
 
@@ -7,24 +8,33 @@ namespace Pipopu;
 internal static class Program
 {
     internal const string IconResource = "pack://application:,,,/Pipopu;component/Pipopu.ico";
+    internal const string InstanceName = "Local\\Pipopu.Tray";
 
     [STAThread]
     private static void Main(string[] args)
     {
+        if (AppUpdate.RunHelper(args))
+            return;
         bool finishingMove = AppPlacement.IsMoveRestart(args);
-        using var instance = new Mutex(false, "Local\\Pipopu.Tray");
+        string? file = ExplorerIntegration.RequestedFile(args);
+        bool restarting = args.Contains(AppUpdate.RestartArgument, StringComparer.Ordinal);
+        using var instance = new Mutex(false, InstanceName);
         try
         {
-            if (!instance.WaitOne(finishingMove ? TimeSpan.FromSeconds(30) : TimeSpan.Zero))
+            if (!instance.WaitOne(finishingMove || restarting ? TimeSpan.FromSeconds(30) : TimeSpan.Zero))
+            {
+                if (file is not null && !ExplorerIntegration.Forward(file))
+                    MessageBox.Show("Pipopu could not open this file. Try again in a moment.", "Pipopu");
                 return;
+            }
         }
         catch (AbandonedMutexException) { }
 
-        try { Run(args, finishingMove); }
+        try { Run(args, finishingMove, restarting, file); }
         finally { instance.ReleaseMutex(); }
     }
 
-    private static void Run(string[] args, bool finishingMove)
+    private static void Run(string[] args, bool finishingMove, bool restarting, string? file)
     {
         TransferLog.Write("Pipopu started");
         ApplicationConfiguration.Initialize();
@@ -40,6 +50,7 @@ internal static class Program
         });
 
         using var tray = new TrayApp(app);
+        ExplorerIntegration.Register();
         if (finishingMove)
         {
             var move = AppPlacement.FinishMove(args[1]);
@@ -50,7 +61,11 @@ internal static class Program
                 MessageBox.Show("Pipopu is running from Local AppData. The original copy could not be removed.",
                     "Pipopu", MessageBoxButton.OK, MessageBoxImage.Information);
         }
-        else if (!args.Contains(AppPlacement.StartupArgument, StringComparer.Ordinal))
+        else if (file is not null)
+        {
+            tray.OpenFile(file);
+        }
+        else if (!restarting && !args.Contains(AppPlacement.StartupArgument, StringComparer.Ordinal))
         {
             if (!tray.ShowFirstRunSetup())
                 tray.ShowComposer();
@@ -75,6 +90,13 @@ internal sealed class TrayApp : IDisposable
     private readonly SettingsStore settings = new();
     private readonly CancellationTokenSource lifetime = new();
     private readonly DispatcherTimer cloudTimer = new() { Interval = TimeSpan.FromSeconds(10) };
+    private readonly DispatcherTimer updateTimer = new() { Interval = TimeSpan.FromSeconds(15) };
+    private readonly AppUpdate updater = new();
+    private readonly System.Diagnostics.Stopwatch idle = System.Diagnostics.Stopwatch.StartNew();
+    private DateTime nextCheck = DateTime.MinValue;
+    private int cloudChecks;
+    private bool updating;
+    private bool helperPrepared;
     private bool exiting;
     private ReceivedPopup? popup;
     private IncomingPopup? incomingPopup;
@@ -86,7 +108,7 @@ internal sealed class TrayApp : IDisposable
     internal TrayApp(Application app)
     {
         this.app = app;
-        composer = new Composer(server);
+        composer = new Composer(server, ShowSettings);
         using var iconStream = Application.GetResourceStream(new Uri(Program.IconResource)).Stream;
         appIcon = new System.Drawing.Icon(iconStream, Forms.SystemInformation.SmallIconSize);
         menu.Items.Add("Open Pipopu", null, (_, _) => ShowComposer());
@@ -111,16 +133,83 @@ internal sealed class TrayApp : IDisposable
         server.IncomingTransferProgress += progress => OnUI(() => UpdateIncoming(progress));
         cloudTimer.Tick += async (_, _) => await CheckCloudAsync();
         cloudTimer.Start();
+        if (AppPlacement.IsInstalled)
+            _ = ExplorerIntegration.ListenAsync(path => OnUI(() => OpenFile(path)), lifetime.Token);
+        OnUI(async () =>
+        {
+            try { await server.StartAsync(); }
+            catch (Exception error) { composer.SetBluetoothStatus(error.Message); }
+        });
+        if (AppPlacement.IsSingleFile)
+        {
+            InputManager.Current.PostProcessInput += RecordInput;
+            updateTimer.Tick += async (_, _) => await CheckUpdateAsync();
+            updateTimer.Start();
+            OnUI(async () => await CheckUpdateAsync());
+        }
+    }
+
+    private void RecordInput(object sender, ProcessInputEventArgs args)
+    {
+        if (args.StagingItem.Input is KeyEventArgs or MouseButtonEventArgs or MouseWheelEventArgs or TouchEventArgs)
+            idle.Restart();
+    }
+
+    private bool Busy => composer.IsBusy || server.HasActiveTransfer || cloudChecks > 0 ||
+        popup is not null || setupWizard is not null;
+
+    private async Task CheckUpdateAsync()
+    {
+        if (exiting)
+            return;
+        if (Busy)
+            idle.Restart();
+        if (updating)
+            return;
+
+        updating = true;
+        try
+        {
+            if (!updater.IsReady && DateTime.UtcNow >= nextCheck)
+            {
+                AppUpdate.CleanUp();
+                nextCheck = DateTime.UtcNow.AddHours(1);
+                await updater.DownloadAsync(lifetime.Token);
+            }
+            if (updater.IsReady && !helperPrepared)
+            {
+                await updater.PrepareHelperAsync(lifetime.Token);
+                helperPrepared = true;
+            }
+            if (updater.IsReady && !exiting && !Busy && idle.Elapsed >= TimeSpan.FromMinutes(10) &&
+                server.TryPauseForUpdate())
+            {
+                try { updater.LaunchHelper(); }
+                catch { server.ResumeAfterUpdateFailure(); throw; }
+                Exit();
+            }
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or
+            System.ComponentModel.Win32Exception or OperationCanceledException)
+        {
+            idle.Restart();
+            helperPrepared = false;
+            if (!exiting)
+                TransferLog.Write($"Update preparation failed reason={error.GetType().Name}");
+        }
+        finally { updating = false; }
     }
 
     private async Task CheckCloudAsync()
     {
+        cloudChecks++;
         try { await server.Deferred.PumpAsync(lifetime.Token); }
         catch (Exception error)
         {
             if (!lifetime.IsCancellationRequested)
                 TransferLog.Write($"Cloud queue check failed reason={error.GetType().Name}");
         }
+        finally { cloudChecks--; }
     }
 
     private void QueueReceipt(Transfer transfer, bool autoSave)
@@ -130,6 +219,7 @@ internal sealed class TrayApp : IDisposable
             transfer.File?.Dispose();
             return;
         }
+        idle.Restart();
         var preferences = settings.Current;
         var cancellation = lifetime.Token;
         Task<ReceivedSaveResult>? save = autoSave && preferences.AutoSave && (transfer.Kind is TransferKind.Image or TransferKind.File)
@@ -196,9 +286,18 @@ internal sealed class TrayApp : IDisposable
 
     internal void ShowComposer()
     {
+        idle.Restart();
         if (popup is not null)
             popup.Topmost = false;
         composer.Present();
+    }
+
+    internal void OpenFile(string path)
+    {
+        if (exiting)
+            return;
+        ShowComposer();
+        composer.OpenFile(path);
     }
 
     internal bool ShowFirstRunSetup()
@@ -266,6 +365,7 @@ internal sealed class TrayApp : IDisposable
 
     internal void ShowSettings()
     {
+        idle.Restart();
         if (settingsWindow is null)
         {
             settingsWindow = SettingsWindows.Settings(settings, server, () => ShowSetupWizard());
@@ -286,6 +386,7 @@ internal sealed class TrayApp : IDisposable
 
     private void ShowCloudTransfers()
     {
+        idle.Restart();
         if (cloudWindow is null)
         {
             cloudWindow = SettingsWindows.CloudStatus(server.Deferred, server.Cloud, CheckCloudAsync,
@@ -319,6 +420,8 @@ internal sealed class TrayApp : IDisposable
         menu.Dispose();
         server.Dispose();
         cloudTimer.Stop();
+        updateTimer.Stop();
+        InputManager.Current.PostProcessInput -= RecordInput;
         lifetime.Cancel();
         foreach (var receipt in receipts)
             ReceivedFiles.Release(receipt.Transfer, receipt.Save);

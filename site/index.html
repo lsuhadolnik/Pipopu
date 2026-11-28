@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Send photos, videos, links, and passwords between your nearby iPhone, iPad, and Windows PC with encrypted transfers.">
-  <meta name="theme-color" content="#f8f7ff">
+  <meta name="theme-color" content="#0b0a10">
   <meta property="og:title" content="Pipopu — Send files to your nearby devices">
   <meta property="og:description" content="Still emailing files to yourself? Send photos, videos, links, and passwords to your nearby devices with encrypted transfers.">
   <meta property="og:type" content="website">
@@ -13,6 +13,7 @@
   <link rel="canonical" href="https://pipopu.solutions.si/">
   <link rel="icon" type="image/png" href="pipopu.png">
   <link rel="stylesheet" href="styles.css">
+  <script src="download.js" defer></script>
   <title>Pipopu — Send files to your nearby devices</title>
 </head>
 <body>
@@ -36,7 +37,8 @@
         <h1 id="hero-title">Still emailing <em>files to yourself?</em></h1>
         <p class="hero-description">Send photos and video clips from your phone to your PC for editing, send a link back to your iPad, or copy a password between your own devices. Pipopu encrypts each transfer.</p>
         <div class="actions">
-          <a class="button" href="#how-it-works">See how it works</a>
+          <a class="button" href="download/Pipopu.exe" data-windows-download download>Download for Windows</a>
+          <a class="button secondary" href="#how-it-works">See how it works</a>
         </div>
       </div>
 
@@ -91,6 +93,20 @@
             <p>Save the clip and drop it into your editor, or copy the link and open it on the bigger screen.</p>
           </article>
         </div>
+        <div class="steps routes" aria-label="Transfer options">
+          <article>
+            <h3>Bluetooth LE, with or without Wi-Fi</h3>
+            <p>Nearby devices find and pair with each other over Bluetooth Low Energy. Send text, links, and small files even when there’s no Wi-Fi.</p>
+          </article>
+          <article>
+            <h3>Fast, secure local transfers</h3>
+            <p>On the same local network, Pipopu can move larger files directly between devices. Your transfer stays encrypted in transit.</p>
+          </article>
+          <article>
+            <h3>OneDrive for larger files</h3>
+            <p>If a local network transfer can’t connect, optional OneDrive support lets Pipopu transfer large files using your account. Pipopu encrypts files before uploading them.</p>
+          </article>
+        </div>
       </div>
     </section>
 
@@ -111,7 +127,7 @@
           </div>
           <div>
             <dt>Send passwords without a preview</dt>
-            <dd>Copy a password or recovery code, then choose <strong>Send securely</strong>. Pipopu hides the text on both screens and skips the cloud queue. On the receiving device, select <strong>Copy secure text</strong> to put it on your clipboard.</dd>
+            <dd>Copy a password or recovery code, then choose <strong>Send Clipboard Securely</strong> on Windows or <strong>Send securely</strong> on iPhone and iPad. Pipopu hides the text on both screens and skips the cloud queue. On the receiving device, select <strong>Copy secure text</strong> to put it on your clipboard.</dd>
           </div>
         </dl>
       </div>
@@ -122,7 +138,8 @@
         <div>
           <p class="eyebrow">Availability</p>
           <h2 id="availability-title">What you’ll need.</h2>
-          <p class="availability-note">Public downloads for the current version are pending.</p>
+          <p class="availability-note">Download the Windows app as a single executable.</p>
+          <div class="actions"><a class="button" href="download/Pipopu.exe" data-windows-download download>Download for Windows</a></div>
           <p class="availability-note">Linux and Android versions are planned.</p>
         </div>
         <ul class="requirements" aria-label="Supported devices">
@@ -142,5 +159,17 @@
       </nav>
     </div>
   </footer>
+
+  <dialog id="windows-download" aria-labelledby="download-title">
+    <form method="dialog"><button class="dialog-close" aria-label="Close download instructions" autofocus>×</button></form>
+    <h2 id="download-title">Open Pipopu on Windows</h2>
+    <ol>
+      <li>Download <strong>Pipopu.exe</strong> below and find it in Downloads.</li>
+      <li>Right-click the file and choose <strong>Properties</strong>.</li>
+      <li>On the <strong>General</strong> tab, select <strong>Unblock</strong> if it appears, then choose <strong>Apply</strong>.</li>
+      <li>Open Pipopu. The setup wizard can move it into Local AppData and add <strong>Open in Pipopu</strong> to File Explorer.</li>
+    </ol>
+    <a class="button" href="download/Pipopu.exe" download>Download Pipopu.exe</a>
+  </dialog>
 </body>
 </html>

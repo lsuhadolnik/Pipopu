@@ -11,31 +11,37 @@ namespace Pipopu;
 internal partial class Composer : FlyoutWindow
 {
     private readonly BluetoothServer server;
+    private readonly Action showSettings;
     private Transfer? attachment;
+    private string? pendingExplorerFile;
     private CancellationTokenSource? sendCancellation;
     private bool sending;
     private bool exiting;
     private bool renaming;
 
-    internal Composer(BluetoothServer server)
+    internal Composer(BluetoothServer server, Action showSettings)
     {
         this.server = server;
+        this.showSettings = showSettings;
         InitializeComponent();
         RefreshDeviceName();
         SendView.CancelRequested += () => sendCancellation?.Cancel();
-        Loaded += StartBluetooth;
         PreviewDragOver += OnDragOver;
         PreviewDrop += OnDrop;
     }
 
-    private async void StartBluetooth(object sender, RoutedEventArgs e)
-    {
-        Loaded -= StartBluetooth;
-        try { await server.StartAsync(); }
-        catch (Exception error) { SetBluetoothStatus(error.Message); }
-    }
-
     internal void PermitClose() => exiting = true;
+    internal bool IsBusy => sending || attachment is not null || Message.Text.Length > 0;
+
+    internal void OpenFile(string path)
+    {
+        if (sending)
+        {
+            pendingExplorerFile = path;
+            return;
+        }
+        TrySetPayload(() => AttachFile(path));
+    }
 
     protected override void OnClosing(CancelEventArgs e)
     {
@@ -255,7 +261,7 @@ internal partial class Composer : FlyoutWindow
     {
         attachment?.File?.Dispose();
         attachment = value;
-        Message.IsEnabled = value is null;
+        MessageInput.Visibility = value is null ? Visibility.Visible : Visibility.Collapsed;
         AttachmentLabel.Text = value is null
             ? "Drop an image or file up to 5 GB"
             : $"{value.Name} ({value.Size:N0} bytes)";
@@ -268,23 +274,24 @@ internal partial class Composer : FlyoutWindow
 
     private void RefreshSend()
     {
-        if (SendButton is null)
+        if (SecureSendButton is null)
             return;
         bool hasPeer = !sending && Peers.SelectedItem is BluetoothServer.Peer;
         bool hasDraft = attachment is not null || Message.Text.Length > 0;
         SendButton.IsEnabled = hasPeer && hasDraft;
-        SendOptions.IsEnabled = !sending && (hasPeer || (hasDraft && server.Trust.All().Length > 0));
+        SecureSendButton.IsEnabled = hasPeer && Peers.SelectedItem is BluetoothServer.Peer peer &&
+            peer.Version >= WireProtocol.CloudAndSecure;
     }
 
     private void SendOptionsClick(object sender, RoutedEventArgs e)
     {
-        SecureSendOption.IsEnabled = Peers.SelectedItem is BluetoothServer.Peer peer &&
-            peer.Version >= WireProtocol.CloudAndSecure;
         CloudSendOption.IsEnabled = (attachment is not null || Message.Text.Length > 0) &&
-            (SecureSendOption.IsEnabled || (Peers.SelectedItem is null && server.Trust.All().Length > 0));
+            (SecureSendButton.IsEnabled || (Peers.SelectedItem is null && server.Trust.All().Length > 0));
         SendOptions.ContextMenu.PlacementTarget = SendOptions;
         SendOptions.ContextMenu.IsOpen = true;
     }
+
+    private void SettingsClick(object sender, RoutedEventArgs e) => showSettings();
 
     private async void SendClick(object sender, RoutedEventArgs e) => await SendDraftAsync(overCloud: false);
 
@@ -364,6 +371,8 @@ internal partial class Composer : FlyoutWindow
             }
             if (!exiting)
             {
+                if (ReferenceEquals(transfer, attachment))
+                    SetAttachment(null);
                 if (overCloud)
                     Status.Text = "Queued. Check Cloud transfers from the tray.";
                 else
@@ -394,6 +403,11 @@ internal partial class Composer : FlyoutWindow
                 SendView.Visibility = Visibility.Collapsed;
                 ComposeView.Visibility = Visibility.Visible;
                 RefreshSend();
+                if (pendingExplorerFile is { } path)
+                {
+                    pendingExplorerFile = null;
+                    OpenFile(path);
+                }
             }
         }
     }

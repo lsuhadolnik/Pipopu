@@ -20,13 +20,20 @@ private final class LocalNetworkPath: @unchecked Sendable {
     var canTryLocalNetwork: Bool { lock.withLock { available != false } }
 }
 
-private final class TransferRoutes: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+private final class TransferRoutes: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    struct Download {
+        let size: Int64
+        let result: AsyncThrowingStream<TemporaryFile, Error>.Continuation
+    }
+
     let cloud: Bool
     let progress: (@MainActor (Double) -> Void)?
+    let download: Download?
 
-    init(cloud: Bool, progress: (@MainActor (Double) -> Void)?) {
+    init(cloud: Bool, progress: (@MainActor (Double) -> Void)?, download: Download? = nil) {
         self.cloud = cloud
         self.progress = progress
+        self.download = download
     }
 
     static func valid(_ url: URL, cloud: Bool) -> Bool {
@@ -57,19 +64,56 @@ private final class TransferRoutes: NSObject, URLSessionTaskDelegate, @unchecked
         let fraction = min(1, Double(totalBytesSent) / Double(totalBytesExpectedToSend))
         Task { @MainActor in progress(fraction) }
     }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        guard let download else { return }
+        do {
+            let status = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 0
+            guard status == 200 else {
+                throw TransferError.message("The file download returned HTTP \(status).")
+            }
+            let bytes = try FileManager.default.attributesOfItem(atPath: location.path)[.size] as? NSNumber
+            guard bytes?.int64Value == download.size else {
+                throw TransferError.message("The downloaded file size did not match the transfer offer.")
+            }
+            let file = TemporaryFile(size: download.size)
+            try FileManager.default.moveItem(at: location, to: file.url)
+            download.result.yield(file)
+            download.result.finish()
+        } catch { download.result.finish(throwing: error) }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error { download?.result.finish(throwing: error) }
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64,
+                    totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+        guard let download else { return }
+        if totalBytesWritten > download.size {
+            download.result.finish(throwing: TransferError.message("The downloaded file exceeded the transfer offer."))
+            downloadTask.cancel()
+            return
+        }
+        guard let progress, download.size > 0 else { return }
+        let fraction = Double(totalBytesWritten) / Double(download.size)
+        Task { @MainActor in progress(fraction) }
+    }
 }
 
 enum BulkNetwork {
     static func startMonitoringLocalNetwork() { _ = LocalNetworkPath.shared }
 
     private static func session(cloud: Bool, timeout: TimeInterval = 30,
-                                progress: (@MainActor (Double) -> Void)? = nil) -> URLSession {
+                                progress: (@MainActor (Double) -> Void)? = nil,
+                                download: TransferRoutes.Download? = nil) -> URLSession {
         let options = URLSessionConfiguration.ephemeral
         options.timeoutIntervalForRequest = timeout
         options.timeoutIntervalForResource = 7200
         options.httpShouldSetCookies = false
         options.urlCache = nil
-        return URLSession(configuration: options, delegate: TransferRoutes(cloud: cloud, progress: progress), delegateQueue: nil)
+        return URLSession(configuration: options,
+                          delegate: TransferRoutes(cloud: cloud, progress: progress, download: download), delegateQueue: nil)
     }
 
     static func localURL(_ candidates: [String]) async throws -> URL {
@@ -102,21 +146,20 @@ enum BulkNetwork {
         return url
     }
 
-    static func download(_ url: URL, cloud: Bool, size: Int64) async throws -> TemporaryFile {
-        let client = session(cloud: cloud)
-        defer { client.finishTasksAndInvalidate() }
-        let (source, response) = try await client.download(from: url)
-        defer { try? FileManager.default.removeItem(at: source) }
-        guard status(response) == 200 else {
-            throw TransferError.message("The file download returned HTTP \(status(response)).")
-        }
-        guard let bytes = try FileManager.default.attributesOfItem(atPath: source.path)[.size] as? NSNumber,
-              bytes.int64Value == size else {
-            throw TransferError.message("The downloaded file size did not match the transfer offer.")
-        }
-        let file = TemporaryFile(size: size)
-        try FileManager.default.moveItem(at: source, to: file.url)
-        return file
+    static func download(_ url: URL, cloud: Bool, size: Int64,
+                         progress: (@MainActor (Double) -> Void)? = nil) async throws -> TemporaryFile {
+        let (files, result) = AsyncThrowingStream<TemporaryFile, Error>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let client = session(cloud: cloud, progress: progress, download: .init(size: size, result: result))
+        defer { client.invalidateAndCancel() }
+        let task = client.downloadTask(with: url)
+        return try await withTaskCancellationHandler {
+            task.resume()
+            var iterator = files.makeAsyncIterator()
+            let file = try await iterator.next()
+            try Task.checkCancellation()
+            guard let file else { throw TransferError.invalid }
+            return file
+        } onCancel: { task.cancel() }
     }
 
     static func uploadLocal(_ url: URL, file: TemporaryFile, progress: @escaping @MainActor (Double) -> Void) async throws {

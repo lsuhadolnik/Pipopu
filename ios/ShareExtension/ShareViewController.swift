@@ -105,6 +105,19 @@ private struct ShareView: View {
                         .frame(maxWidth: .infinity)
                     }
                 }
+                if !offlineDevices.isEmpty {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Trusted devices out of range").font(.headline)
+                            .accessibilityAddTraits(.isHeader)
+                        ForEach(offlineDevices) { peer in
+                            LabeledContent(peer.name, value: "Out of range")
+                                .font(.subheadline)
+                        }
+                        Text("Open Pipopu on a nearby device to send to it.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
             .padding(22)
             .frame(maxWidth: 560)
@@ -119,6 +132,11 @@ private struct ShareView: View {
                 Button("Cancel", action: close)
             }
         }
+    }
+
+    private var offlineDevices: [PeerTrust] {
+        let nearby = Set(bluetooth.peers.compactMap(\.identity))
+        return bluetooth.trustedDevices.filter { !nearby.contains($0.id) }
     }
 
     private func preview(_ item: Transfer) -> some View {

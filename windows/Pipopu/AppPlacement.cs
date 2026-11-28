@@ -22,7 +22,8 @@ internal static class AppPlacement
     internal static bool IsInstalled => string.Equals(CurrentExe, InstalledExe, StringComparison.OrdinalIgnoreCase);
 
     [UnconditionalSuppressMessage("SingleFile", "IL3000", Justification = "An empty assembly location identifies the single-file bundle.")]
-    internal static bool CanMove => !IsInstalled && string.IsNullOrEmpty(typeof(AppPlacement).Assembly.Location);
+    internal static bool IsSingleFile => string.IsNullOrEmpty(typeof(AppPlacement).Assembly.Location);
+    internal static bool CanMove => !IsInstalled && IsSingleFile;
 
     internal static string? StartupCommand()
     {

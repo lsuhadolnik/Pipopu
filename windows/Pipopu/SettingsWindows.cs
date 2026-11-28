@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Reflection;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Threading;
@@ -103,19 +102,22 @@ internal static class SettingsWindows
             }
             catch (Exception error) { MessageBox.Show(window, error.Message, "Pipopu"); }
         });
-        var assembly = typeof(SettingsWindows).Assembly;
-        string? version = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
-            .InformationalVersion.Split('+', 2)[0] ?? assembly.GetName().Version?.ToString(3);
-        if (version is not null)
+        AddButton(appActions, "Changelog…", () =>
         {
-            var versionText = new TextBlock
-            {
-                Text = $"Version {version}", Margin = new Thickness(0, 20, 0, 0),
-                HorizontalAlignment = HorizontalAlignment.Right
-            };
-            versionText.SetResourceReference(TextBlock.ForegroundProperty, "TextFillColorSecondaryBrush");
-            body.Children.Add(versionText);
-        }
+            var (changes, content) = CreateWindow("Pipopu changelog", 500);
+            changes.Owner = window;
+            using var stream = typeof(SettingsWindows).Assembly.GetManifestResourceStream("Pipopu.Changelog")!;
+            using var reader = new StreamReader(stream);
+            content.Children.Add(new TextBlock { Text = reader.ReadToEnd(), TextWrapping = TextWrapping.Wrap });
+            changes.Show();
+        });
+        var versionText = new TextBlock
+        {
+            Text = $"Version {AppUpdate.VersionText}", Margin = new Thickness(0, 20, 0, 0),
+            HorizontalAlignment = HorizontalAlignment.Right
+        };
+        versionText.SetResourceReference(TextBlock.ForegroundProperty, "TextFillColorSecondaryBrush");
+        body.Children.Add(versionText);
         cloudStatus.Text = service.IsSignedIn ? "Signed in to OneDrive." : "Sign in when you want to use OneDrive.";
         Refresh();
 

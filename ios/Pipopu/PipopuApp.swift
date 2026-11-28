@@ -20,10 +20,14 @@ private struct ReceiverView: View {
     @State private var unreadReceipt = false
 
     private enum Tab { case send, activity, settings }
-    @State private var exporting = false
     @State private var status = ""
     @State private var fileExport: ExportFile?
-    @State private var latestReceipt: UUID?
+    @State private var activityItems = ActivityArchive.items()
+    @State private var unsavedActivity: [String: Transfer] = [:]
+    @State private var archivingActivity: Set<String> = []
+    @State private var conversation: String?
+    @State private var incomingBanner: Bluetooth.IncomingActivity?
+    @State private var itemToDelete: ActivityItem?
     @State private var draft = ""
     @State private var attachment: Transfer?
     @State private var importing = false
@@ -64,7 +68,18 @@ private struct ReceiverView: View {
         .onChange(of: phase) { _, _ in updateListening() }
         .onChange(of: listening) { _, _ in updateListening() }
         .onChange(of: draft) { _, _ in sendStatus = "" }
-        .onReceive(bluetooth.$received, perform: receive)
+        .onReceive(bluetooth.activityEvents, perform: recordActivity)
+        .onChange(of: bluetooth.incomingActivity) { previous, current in
+            if let started = current.values.first(where: { previous[$0.id] == nil }) {
+                incomingBanner = started
+            }
+        }
+        .overlay(alignment: .top) { transferBanner }
+        .task(id: bannerDismissal) {
+            guard bannerDismissal != nil else { return }
+            do { try await Task.sleep(for: .seconds(4)) } catch { return }
+            incomingBanner = nil
+        }
         .sensoryFeedback(.impact(weight: .light), trigger: sendAttempt)
         .sensoryFeedback(trigger: finishedAttempt) { _, _ in
             bluetooth.sendCompleted ? .success : .error
@@ -85,16 +100,43 @@ private struct ReceiverView: View {
         .sheet(item: $fileExport) { file in
             LargeFileExporter(file: file)
         }
-        .fileExporter(
-            isPresented: $exporting,
-            document: bluetooth.received.map { ReceivedDocument(data: $0.data) },
-            contentType: exportType,
-            defaultFilename: exportName
-        ) { result in
-            switch result {
-            case .success: status = "Saved"
-            case .failure(let error): status = error.localizedDescription
+        .alert("Delete this transfer from Activity?", isPresented: Binding(
+            get: { itemToDelete != nil }, set: { if !$0 { itemToDelete = nil } }
+        ), presenting: itemToDelete) { item in
+            Button("Delete", role: .destructive) { deleteActivity(item) }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text("Copies you saved to Files remain available.")
+        }
+    }
+
+    private var bannerDismissal: String? {
+        guard let incomingBanner, bluetooth.incomingActivity[incomingBanner.id] == nil else { return nil }
+        return incomingBanner.id
+    }
+
+    @ViewBuilder private var transferBanner: some View {
+        if let banner = incomingBanner, tab != .activity || conversation != banner.device {
+            Button {
+                editingDraft = false
+                fileSend = nil
+                openConversation(banner.device)
+                incomingBanner = nil
+            } label: {
+                if let active = bluetooth.incomingActivity[banner.id] {
+                    incomingRow(active)
+                } else {
+                    Label("View transfer from \(banner.deviceName)", systemImage: "tray.and.arrow.down")
+                }
             }
+            .buttonStyle(.plain)
+            .padding(14)
+            .frame(maxWidth: 400)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+            .shadow(color: .black.opacity(0.2), radius: 12, y: 4)
+            .padding(.horizontal, 16)
+            .padding(.top, 6)
+            .accessibilityHint("Opens Activity")
         }
     }
 
@@ -143,57 +185,124 @@ private struct ReceiverView: View {
 
     private var activity: some View {
         List {
-            screenHeading("Activity")
-            if let transfer = bluetooth.received {
-                Section("Received") {
-                    if transfer.kind == .text {
-                        if transfer.secure {
-                            Button("Copy secure text", systemImage: "lock.doc") {
-                                UIPasteboard.general.setItems(
-                                    [[UTType.utf8PlainText.identifier: transfer.text]], options: [.localOnly: true])
-                                status = "Copied secure text"
-                            }
-                        } else {
-                            Text(transfer.text).textSelection(.enabled)
-                            Button("Copy text", systemImage: "doc.on.doc") {
-                                UIPasteboard.general.string = transfer.text
-                                status = "Copied text"
-                            }
-                        }
-                    } else {
-                        if transfer.kind == .image, let image = imagePreview(transfer) {
-                            Image(uiImage: image).resizable().scaledToFit().frame(maxHeight: 240)
-                            Button("Copy image", systemImage: "doc.on.doc") {
-                                UIPasteboard.general.image = image
-                                status = "Copied image"
-                            }
-                        }
-                        Button("Save " + (transfer.name.isEmpty ? "item" : transfer.name), systemImage: "square.and.arrow.down") {
-                            if let file = transfer.file {
-                                do { fileExport = try ExportFile(file, name: exportName) }
-                                catch { status = error.localizedDescription }
-                            } else {
-                                exporting = true
-                            }
-                        }
+            if let conversation {
+                Button("All conversations", systemImage: "chevron.left") {
+                    self.conversation = nil
+                    status = ""
+                }
+                screenHeading(deviceName(conversation))
+                if !status.isEmpty { Text(status).foregroundStyle(.secondary) }
+                ForEach(incomingTransfers.filter { $0.device == conversation }, id: \.id) { incomingRow($0) }
+                ForEach(activityItems.filter { $0.device == conversation }.sorted { $0.date > $1.date }) { item in
+                    activityBubble(item)
+                }
+                if let error = bluetooth.receiveError { Text(error).foregroundStyle(.secondary) }
+            } else {
+                screenHeading("Activity")
+                Section("Conversations") {
+                    if activityDevices.isEmpty {
+                        Label("No transfers yet", systemImage: "tray").foregroundStyle(.secondary)
                     }
-                    Button("Clear", role: .destructive) {
-                        bluetooth.clearReceived()
-                        status = ""
+                    ForEach(activityDevices, id: \.self) { device in
+                        Button { openConversation(device) } label: {
+                            HStack {
+                                Image(systemName: "desktopcomputer").foregroundStyle(accent)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(deviceName(device)).font(.headline)
+                                    if let active = incomingTransfers.first(where: { $0.device == device }) {
+                                        Text("Receiving \(active.name)").font(.subheadline).foregroundStyle(.secondary)
+                                    } else if let item = activityItems.first(where: { $0.device == device }) {
+                                        Text(item.isText ? (item.secure ? "Secure text" : "Message") : item.name)
+                                            .font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                                    }
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        .buttonStyle(.plain)
                     }
                 }
+                if !status.isEmpty { Text(status).foregroundStyle(.secondary) }
+                cloudTransfers
             }
-            if bluetooth.received == nil {
-                Section("Received") {
-                    Label("No recent transfers", systemImage: "tray")
-                        .foregroundStyle(.secondary)
-                }
-            }
-            if !status.isEmpty { Text(status).foregroundStyle(.secondary) }
-            if let error = bluetooth.receiveError { Text(error).foregroundStyle(.secondary) }
-            cloudTransfers
         }
         .listStyle(.insetGrouped)
+    }
+
+    private var incomingTransfers: [Bluetooth.IncomingActivity] {
+        bluetooth.incomingActivity.values.sorted { $0.id < $1.id }
+    }
+
+    private var activityDevices: [String] {
+        var seen = Set<String>()
+        return (incomingTransfers.map(\.device) + activityItems.map(\.device)).filter { seen.insert($0).inserted }
+    }
+
+    private func deviceName(_ device: String) -> String {
+        incomingTransfers.first { $0.device == device }?.deviceName ??
+            bluetooth.trustedDevices.first { $0.id == device }?.name ??
+            activityItems.first { $0.device == device }?.deviceName ?? "Device"
+    }
+
+    private func openConversation(_ device: String) {
+        conversation = device
+        tab = .activity
+        unreadReceipt = false
+        status = ""
+    }
+
+    private func incomingRow(_ transfer: Bluetooth.IncomingActivity) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label("Receiving \(transfer.name)", systemImage: "tray.and.arrow.down").font(.subheadline.weight(.semibold))
+            Text(transfer.deviceName).font(.caption).foregroundStyle(.secondary)
+            if let fraction = transfer.fraction {
+                ProgressView(value: fraction) { Text(fraction.formatted(.percent.precision(.fractionLength(0)))) }
+                    .font(.caption)
+            } else {
+                ProgressView("Preparing transfer…").font(.caption)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func activityBubble(_ item: ActivityItem) -> some View {
+        VStack(alignment: item.outgoing ? .trailing : .leading, spacing: 4) {
+            let direction = item.queued ? "Queued" : (item.outgoing ? "Sent" : "Received")
+            Text("\(direction) · \(item.date.formatted(date: .abbreviated, time: .shortened))")
+                .font(.caption).foregroundStyle(.secondary)
+            Button {
+                openActivityItem(item)
+            } label: {
+                Group {
+                    if item.isText {
+                        if item.secure {
+                            Label("Copy secure text", systemImage: "lock.doc")
+                        } else {
+                            Text((try? activityText(item, preview: true)) ?? "Message unavailable")
+                                .lineLimit(12)
+                                .accessibilityHint("Copies the message")
+                        }
+                    } else {
+                        Label(ReceivedFileArchive.name(item.name), systemImage: "square.and.arrow.up")
+                    }
+                }
+                .padding(11)
+                .background(item.outgoing ? accent.opacity(0.17) : Color.secondary.opacity(0.12),
+                            in: RoundedRectangle(cornerRadius: 14))
+            }
+            .buttonStyle(.plain)
+            .contextMenu {
+                if item.kind == Transfer.Kind.image.rawValue && item.size <= 8_000_000 {
+                    Button("Copy image", systemImage: "doc.on.doc") { copyActivityImage(item) }
+                }
+                Button("Delete from Activity", systemImage: "trash", role: .destructive) { itemToDelete = item }
+                    .disabled(archivingActivity.contains(item.id))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: item.outgoing ? .trailing : .leading)
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
     }
 
     private var settings: some View {
@@ -447,42 +556,106 @@ private struct ReceiverView: View {
         }
     }
 
-    private var exportName: String {
-        ReceivedFileArchive.name(bluetooth.received?.name ?? "")
-    }
-
-    private var exportType: UTType {
-        UTType(filenameExtension: (exportName as NSString).pathExtension) ?? .data
-    }
-
-    private func imagePreview(_ transfer: Transfer) -> UIImage? {
-        if let file = transfer.file {
-            guard file.size <= 8_000_000 else { return nil }
-            return UIImage(contentsOfFile: file.url.path)
+    private func activityText(_ item: ActivityItem, preview: Bool = false) throws -> String {
+        let data: Data
+        if let transfer = unsavedActivity[item.id] {
+            data = preview ? Data(transfer.data.prefix(8192)) : transfer.data
+        } else {
+            let file = try ActivityArchive.file(item)
+            if preview {
+                let input = try FileHandle(forReadingFrom: file.url)
+                defer { try? input.close() }
+                data = try input.read(upToCount: 8192) ?? Data()
+            } else {
+                data = try Data(contentsOf: file.url)
+            }
         }
-        return UIImage(data: transfer.data)
+        return String(decoding: data, as: UTF8.self)
     }
 
-    private func receive(_ transfer: Transfer?) {
-        guard latestReceipt != transfer?.id else { return }
-        latestReceipt = transfer?.id
-        if transfer != nil && tab != .activity { unreadReceipt = true }
-        if transfer == nil { unreadReceipt = false }
-        status = ""
-        guard saveReceivedFiles, let transfer, transfer.kind != .text, !transfer.replay else { return }
+    private func openActivityItem(_ item: ActivityItem) {
+        do {
+            if item.isText {
+                let value = try activityText(item)
+                if item.secure {
+                    UIPasteboard.general.setItems([[UTType.utf8PlainText.identifier: value]], options: [.localOnly: true])
+                } else {
+                    UIPasteboard.general.string = value
+                }
+                status = item.secure ? "Copied secure text" : "Copied text"
+            } else {
+                let file: TemporaryFile
+                if let transfer = unsavedActivity[item.id] {
+                    if let existing = transfer.file { file = existing }
+                    else {
+                        file = TemporaryFile(size: transfer.size)
+                        try transfer.data.write(to: file.url)
+                    }
+                } else {
+                    file = try ActivityArchive.file(item)
+                }
+                fileExport = try ExportFile(file, name: ReceivedFileArchive.name(item.name))
+            }
+        } catch { status = error.localizedDescription }
+    }
 
-        status = "Saving automatically…"
+    private func copyActivityImage(_ item: ActivityItem) {
+        let image: UIImage?
+        if let transfer = unsavedActivity[item.id] {
+            image = transfer.file.map { UIImage(contentsOfFile: $0.url.path) } ?? UIImage(data: transfer.data)
+        } else if let file = try? ActivityArchive.file(item) {
+            image = UIImage(contentsOfFile: file.url.path)
+        } else {
+            image = nil
+        }
+        guard let image else { status = "Could not open the image."; return }
+        UIPasteboard.general.image = image
+        status = "Copied image"
+    }
+
+    private func deleteActivity(_ item: ActivityItem) {
+        do {
+            if unsavedActivity.removeValue(forKey: item.id) == nil {
+                try ActivityArchive.remove(item)
+            }
+            activityItems.removeAll { $0.id == item.id }
+            status = ""
+        } catch { status = error.localizedDescription }
+    }
+
+    private func recordActivity(_ event: Bluetooth.ActivityEvent) {
+        let transfer = event.transfer
+        if transfer.replay { openConversation(event.device) }
+        guard !activityItems.contains(where: { $0.id == event.id }) else { return }
+        let item = ActivityItem(event)
+        activityItems.insert(item, at: 0)
+        unsavedActivity[item.id] = transfer
+        archivingActivity.insert(item.id)
+        if !event.outgoing && (tab != .activity || conversation != event.device) { unreadReceipt = true }
+        let autoSave = saveReceivedFiles && !event.outgoing && !item.isText && !transfer.replay
+
         Task {
             let result = await Task.detached(priority: .utility) {
-                do {
-                    try ReceivedFileArchive.save(transfer)
-                    return "Saved to Files."
-                } catch {
-                    return "Automatic save failed. " + error.localizedDescription
-                }
+                Result { try ActivityArchive.save(item, transfer: transfer) }
             }.value
-            if latestReceipt == transfer.id {
-                status = result
+            archivingActivity.remove(item.id)
+            switch result {
+            case .success(let stored):
+                if let index = activityItems.firstIndex(where: { $0.id == stored.id }) {
+                    activityItems[index] = stored
+                }
+                unsavedActivity[stored.id] = nil
+            case .failure(let error):
+                if conversation == item.device || conversation == nil {
+                    status = "Could not keep this transfer in Activity. " + error.localizedDescription
+                }
+            }
+            if autoSave {
+                let message = await Task.detached(priority: .utility) {
+                    do { try ReceivedFileArchive.save(transfer); return "Saved to Files." }
+                    catch { return "Automatic save failed. " + error.localizedDescription }
+                }.value
+                if conversation == item.device || conversation == nil { status = message }
             }
         }
     }
@@ -503,7 +676,6 @@ private struct ReceiverView: View {
         }
     }
 }
-
 private enum ReceivedFileArchive {
     static func name(_ original: String) -> String {
         let path = original.replacingOccurrences(of: "\\", with: "/")
@@ -580,7 +752,7 @@ private struct LargeFileExporter: UIViewControllerRepresentable {
 }
 
 private struct SetupView: View {
-    static let downloadURL = URL(string: "https://github.com/lsuhadolnik/Pipopu/releases/latest")!
+    static let downloadURL = URL(string: "https://pipopu.solutions.si/#availability")!
 
     let tint: Color
     let finish: () -> Void
@@ -640,21 +812,5 @@ private struct SetupView: View {
                 Text(detail).font(.subheadline).foregroundStyle(.secondary)
             }
         }
-    }
-}
-
-private struct ReceivedDocument: FileDocument {
-    static let readableContentTypes: [UTType] = [.data]
-    let data: Data
-
-    init(data: Data) { self.data = data }
-
-    init(configuration: ReadConfiguration) throws {
-        guard let data = configuration.file.regularFileContents else { throw TransferError.invalid }
-        self.data = data
-    }
-
-    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
-        FileWrapper(regularFileWithContents: data)
     }
 }

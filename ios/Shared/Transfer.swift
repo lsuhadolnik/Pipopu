@@ -162,6 +162,7 @@ struct IncomingPacket {
     let token: UInt32
     let length: Int
     private var bytes = Data()
+    var fraction: Double { Double(bytes.count) / Double(length) }
 
     init(_ begin: Data) throws {
         guard begin.count == 9 else { throw TransferError.invalid }
