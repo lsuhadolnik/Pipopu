@@ -121,9 +121,11 @@ internal sealed class AppUpdate
             {
                 try
                 {
-                    using var file = File.Open(stage, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
-                    if (!Convert.ToHexString(SHA256.HashData(file)).Equals(args[3], StringComparison.OrdinalIgnoreCase))
-                        throw new InvalidDataException("The staged update checksum changed.");
+                    using (var file = File.OpenRead(stage))
+                    {
+                        if (!Convert.ToHexString(SHA256.HashData(file)).Equals(args[3], StringComparison.OrdinalIgnoreCase))
+                            throw new InvalidDataException("The staged update checksum changed.");
+                    }
                     File.Replace(stage, target, backup);
                     try { Start(target, RestartArgument); }
                     catch

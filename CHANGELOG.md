@@ -1,3 +1,7 @@
+# Pipopu 0.4.1
+
+- Close the staged executable before Windows applies an update in place.
+
 # Pipopu 0.4.0
 
 ## Windows
